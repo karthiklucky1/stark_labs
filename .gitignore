@@ -1,0 +1,49 @@
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+ENV/
+studio/backend/venv/
+
+# Node / Next.js
+node_modules/
+studio/frontend/node_modules/
+studio/frontend/.next/
+studio/frontend/out/
+
+# Build and coverage
+build/
+dist/
+coverage/
+.coverage
+htmlcov/
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs and runtime artifacts
+logs/
+*.log
+studio/backend/backend.log
+studio/backend/backend_runtime.log
+studio/backend/server.log
+studio/backend/service.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

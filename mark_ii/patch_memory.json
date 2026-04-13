@@ -1,0 +1,327 @@
+[
+  {
+    "mark": "I",
+    "failure_type": "RACE_CONDITION \u2014 concurrent writes caused double-spending (balance went sub-zero)",
+    "patch_file": "target_api_markii.py",
+    "accepted": true,
+    "selected_provider": "OpenAI",
+    "selected_model": "gpt-4o",
+    "selected_score": 106.2,
+    "rejection_reason": null,
+    "candidates": [
+      {
+        "provider": "OpenAI",
+        "model": "gpt-4o",
+        "score": 106.2,
+        "accepted": true,
+        "rejection_reason": null,
+        "failure_type": null,
+        "lines_changed": 76,
+        "checks": [
+          {
+            "name": "syntax",
+            "passed": true,
+            "detail": "Syntax check passed",
+            "metrics": {}
+          },
+          {
+            "name": "startup",
+            "passed": true,
+            "detail": "Server ready with status 200",
+            "metrics": {}
+          },
+          {
+            "name": "smoke",
+            "passed": true,
+            "detail": "Smoke suite passed with balance=99.0",
+            "metrics": {
+              "remaining_balance": 99.0
+            }
+          },
+          {
+            "name": "swarm",
+            "passed": true,
+            "detail": "API secure: armor holds",
+            "metrics": {
+              "critical_failures": 0,
+              "passed_phases": 4,
+              "verdict": "API secure: armor holds"
+            }
+          }
+        ],
+        "swarm_report": {
+          "base_url": "http://127.0.0.1:8111",
+          "passed": true,
+          "phases": [
+            {
+              "phase_id": 1,
+              "name": "Race Condition",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "Successful transfers=1",
+                "Errors=0",
+                "Balance=0.0",
+                "Elapsed=0.14s"
+              ],
+              "metrics": {
+                "successful_transfers": 1,
+                "errors": 0,
+                "balance": 0.0,
+                "elapsed_s": 0.14
+              }
+            },
+            {
+              "phase_id": 2,
+              "name": "Payload Injection",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "payload={'user_id': \"' OR 1=1; DROP TABLE users; --\", 'amount': 10.0 status=422",
+                "payload={'user_id': '<script>alert(1)</script>', 'amount': 10.0} status=422",
+                "payload={'user_id': 'user_1\\x00evil', 'amount': 10.0} status=422",
+                "payload={'user_id': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA status=404",
+                "payload={'user_id': 'user_1', 'amount': 'ten dollars'} status=422",
+                "payload={'user_id': None, 'amount': 10.0} status=422",
+                "payload={'user_id': {'nested': 'object'}, 'amount': 10.0} status=422",
+                "payload={'user_id': 'user_1', 'amount': {'price': 10}} status=422"
+              ],
+              "metrics": {
+                "payloads_tested": 8,
+                "accepted_statuses": 0
+              }
+            },
+            {
+              "phase_id": 3,
+              "name": "Boundary Attack",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "amount=-1000.0 status=422",
+                "amount=0.0 status=422",
+                "amount=1e+308 status=422",
+                "amount=-0.0001 status=422",
+                "amount=10.0 status=404"
+              ],
+              "metrics": {
+                "cases_tested": 5
+              }
+            },
+            {
+              "phase_id": 4,
+              "name": "Endpoint Flood",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "successful_transfers_during_flood=0",
+                "final_balance=100.0"
+              ],
+              "metrics": {
+                "successful_transfers_during_flood": 0,
+                "final_balance": 100.0
+              }
+            }
+          ],
+          "summary": {
+            "critical_failures": 0,
+            "passed_phases": 4,
+            "verdict": "API secure: armor holds"
+          }
+        },
+        "promoted_file": "target_api_markii.py"
+      }
+    ]
+  },
+  {
+    "mark": "I",
+    "failure_type": "RACE_CONDITION \u2014 concurrent writes caused double-spending (balance went sub-zero)",
+    "patch_file": "target_api_markii.py",
+    "accepted": true,
+    "selected_provider": "OpenAI",
+    "selected_model": "gpt-4o",
+    "selected_score": 116.1,
+    "selected_format": "structured_patch",
+    "selected_patch_summary": "Implemented locking, input validation, and rate limiting to prevent race conditions, boundary violations, and flooding.",
+    "rejection_reason": null,
+    "candidates": [
+      {
+        "provider": "OpenAI",
+        "model": "gpt-4o",
+        "score": 116.1,
+        "accepted": true,
+        "rejection_reason": null,
+        "failure_type": null,
+        "candidate_format": "structured_patch",
+        "patch_summary": "Implemented locking, input validation, and rate limiting to prevent race conditions, boundary violations, and flooding.",
+        "operations_count": 4,
+        "lines_changed": 54,
+        "checks": [
+          {
+            "name": "syntax",
+            "passed": true,
+            "detail": "Syntax check passed",
+            "metrics": {}
+          },
+          {
+            "name": "startup",
+            "passed": true,
+            "detail": "ASGI app imported successfully",
+            "metrics": {
+              "route_count": 7,
+              "openapi_ok": true,
+              "openapi_detail": "OpenAPI schema includes required routes",
+              "documented_paths": 3,
+              "title": "FastAPI"
+            }
+          },
+          {
+            "name": "openapi",
+            "passed": true,
+            "detail": "OpenAPI schema includes required routes",
+            "metrics": {
+              "documented_paths": 3,
+              "title": "FastAPI"
+            }
+          },
+          {
+            "name": "smoke",
+            "passed": true,
+            "detail": "Smoke suite passed with balance=99.0",
+            "metrics": {
+              "remaining_balance": 99.0
+            }
+          },
+          {
+            "name": "swarm",
+            "passed": true,
+            "detail": "API secure: armor holds",
+            "metrics": {
+              "critical_failures": 0,
+              "passed_phases": 6,
+              "verdict": "API secure: armor holds"
+            }
+          }
+        ],
+        "swarm_report": {
+          "base_url": "http://markii.local",
+          "passed": true,
+          "phases": [
+            {
+              "phase_id": 1,
+              "name": "Race Condition",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "Successful transfers=5",
+                "Errors=0",
+                "Balance=50.0",
+                "Elapsed=0.01s"
+              ],
+              "metrics": {
+                "successful_transfers": 5,
+                "errors": 0,
+                "balance": 50.0,
+                "elapsed_s": 0.01
+              }
+            },
+            {
+              "phase_id": 2,
+              "name": "Payload Injection",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "payload={'user_id': \"' OR 1=1; DROP TABLE users; --\", 'amount': 10.0 status=422",
+                "payload={'user_id': '<script>alert(1)</script>', 'amount': 10.0} status=422",
+                "payload={'user_id': 'user_1\\x00evil', 'amount': 10.0} status=422",
+                "payload={'user_id': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA status=404",
+                "payload={'user_id': 'user_1', 'amount': 'ten dollars'} status=422",
+                "payload={'user_id': None, 'amount': 10.0} status=422",
+                "payload={'user_id': {'nested': 'object'}, 'amount': 10.0} status=422",
+                "payload={'user_id': 'user_1', 'amount': {'price': 10}} status=422"
+              ],
+              "metrics": {
+                "payloads_tested": 8,
+                "accepted_statuses": 0
+              }
+            },
+            {
+              "phase_id": 3,
+              "name": "Boundary Attack",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "amount=-1000.0 status=422",
+                "amount=0.0 status=422",
+                "amount=1e+308 status=422",
+                "amount=-0.0001 status=422",
+                "amount=10.0 status=404"
+              ],
+              "metrics": {
+                "cases_tested": 5
+              }
+            },
+            {
+              "phase_id": 4,
+              "name": "Endpoint Flood",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "successful_transfers_during_flood=0",
+                "final_balance=100.0"
+              ],
+              "metrics": {
+                "successful_transfers_during_flood": 0,
+                "final_balance": 100.0
+              }
+            },
+            {
+              "phase_id": 5,
+              "name": "Malformed JSON",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "payload='{' status=422",
+                "payload='{\"user_id\": \"user_1\"' status=422",
+                "payload='{\"user_id\": \"user_1\", \"amount\": }' status=422",
+                "payload='not-json' status=422"
+              ],
+              "metrics": {
+                "payloads_tested": 4,
+                "status_counts": {
+                  "422": 4
+                },
+                "post_attack_balance_status": 200
+              }
+            },
+            {
+              "phase_id": 6,
+              "name": "Path Probe",
+              "passed": true,
+              "critical": false,
+              "details": [
+                "user_id='user_1' status=200",
+                "user_id='ghost_user' status=200",
+                "user_id='..%2Fetc%2Fpasswd' status=200",
+                "user_id='%00evil' status=200",
+                "user_id='<script>alert(1)</script>' status=404"
+              ],
+              "metrics": {
+                "payloads_tested": 5,
+                "status_counts": {
+                  "200": 4,
+                  "404": 1
+                }
+              }
+            }
+          ],
+          "summary": {
+            "critical_failures": 0,
+            "passed_phases": 6,
+            "verdict": "API secure: armor holds"
+          }
+        },
+        "promoted_file": "target_api_markii.py"
+      }
+    ]
+  }
+]

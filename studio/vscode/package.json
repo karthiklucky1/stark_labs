@@ -1,0 +1,107 @@
+{
+  "name": "mark-ii-studio",
+  "displayName": "Mark II Studio",
+  "description": "VS Code companion for Mark II Studio — build, break, and heal code with AI.",
+  "version": "1.0.0",
+  "publisher": "stark-labs",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "media/icon.png",
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "markii-studio",
+          "title": "Mark II Studio",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "markii-studio": [
+        {
+          "id": "markii-sessions",
+          "name": "Sessions"
+        },
+        {
+          "id": "markii-events",
+          "name": "Event Stream"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "markii.connect",
+        "title": "Mark II: Connect to Studio"
+      },
+      {
+        "command": "markii.newSession",
+        "title": "Mark II: New Session from Workspace"
+      },
+      {
+        "command": "markii.sendComment",
+        "title": "Mark II: Send Comment / Special Instruction"
+      },
+      {
+        "command": "markii.refreshSessions",
+        "title": "Mark II: Refresh Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "markii.openPreview",
+        "title": "Mark II: Open Live Preview"
+      },
+      {
+        "command": "markii.downloadArtifacts",
+        "title": "Mark II: Download Artifacts"
+      },
+      {
+        "command": "markii.setApiUrl",
+        "title": "Mark II: Set API URL"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "markii.refreshSessions",
+          "when": "view == markii-sessions",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Mark II Studio",
+      "properties": {
+        "markii.apiUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "Backend API URL for Mark II Studio"
+        },
+        "markii.autoStream": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically stream events when a session is selected"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "watch": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}

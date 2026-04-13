@@ -1,0 +1,91 @@
+{
+  "task_name": "payment_api",
+  "description": "A single-file FastAPI payment server with transfer, balance, and reset endpoints that must survive adversarial traffic.",
+  "framework": "fastapi_single_file",
+  "attack_profile": "payment_api",
+  "source_file": "target_api.py",
+  "bootstrap_prompt": "Build a single-file FastAPI payment API with POST /transfer, GET /balance/{user_id}, and POST /reset. Seed user_1 with balance 100.0. A valid transfer for user_1 amount=1.0 must succeed after reset. Use Pydantic v2 and run on port 8111.",
+  "required_routes": [
+    {
+      "path": "/transfer",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/balance/{user_id}",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/reset",
+      "methods": [
+        "POST"
+      ]
+    }
+  ],
+  "smoke_steps": [
+    {
+      "name": "reset",
+      "method": "POST",
+      "path": "/reset",
+      "expected_statuses": [
+        200
+      ]
+    },
+    {
+      "name": "transfer",
+      "method": "POST",
+      "path": "/transfer",
+      "json_body": {
+        "user_id": "user_1",
+        "amount": 1.0
+      },
+      "expected_statuses": [
+        200
+      ]
+    },
+    {
+      "name": "balance",
+      "method": "GET",
+      "path": "/balance/user_1",
+      "expected_statuses": [
+        200
+      ],
+      "expect_json_field": "balance",
+      "expect_json_type": "number",
+      "save_metric_as": "remaining_balance"
+    }
+  ],
+  "security_requirements": [
+    "Race conditions must be prevented with asyncio.Lock around balance mutation.",
+    "Boundary violations must reject amount <= 0 or amount > 1_000_000 with HTTP 422.",
+    "Payload injection must validate user_id with regex ^[A-Za-z0-9_]+$ and reject invalid input.",
+    "Flooding must be limited with a simple in-memory rate limiter using plain dict + time in route bodies."
+  ],
+  "behavior_requirements": [
+    "Preserve port 8111.",
+    "Keep the seeded account user_id exactly as user_1.",
+    "POST /reset must restore user_1 balance to 100.0.",
+    "A valid transfer for user_1 amount=1.0 must succeed after reset."
+  ],
+  "technical_requirements": [
+    "Use Pydantic v2 field_validator syntax.",
+    "If field_validator is used, import it explicitly from pydantic.",
+    "Keep imports complete and do not reference undefined names.",
+    "Do not use BaseHTTPMiddleware for rate limiting.",
+    "Do not use Depends(rate_limiter) for request bodies; call the limiter inline in each route.",
+    "Remove asyncio.sleep(0.1) from the vulnerable implementation.",
+    "Prefer the smallest targeted edit set that fully fixes the vulnerability."
+  ],
+  "context": {
+    "seed_user_id": "user_1",
+    "transfer_path": "/transfer",
+    "balance_path_template": "/balance/{user_id}",
+    "reset_path": "/reset",
+    "valid_transfer_amount": 1.0,
+    "attack_transfer_amount": 10.0,
+    "max_expected_successes_under_race": 10
+  }
+}
