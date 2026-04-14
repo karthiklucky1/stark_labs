@@ -34,6 +34,10 @@ class ProjectSession(Base, TimestampMixin):
         String(64), nullable=True
     )  # fastapi_service | nextjs_webapp | None (unsupported)
 
+    build_mode: Mapped[str] = mapped_column(
+        String(32), default="balanced"
+    )  # fast | balanced | max_quality
+
     # Session state machine
     status: Mapped[str] = mapped_column(
         String(32), default="created"
@@ -43,6 +47,7 @@ class ProjectSession(Base, TimestampMixin):
     github_repo_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     original_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     intake_files_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    architecture_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
     # Relationships
     user = relationship("User", back_populates="sessions", lazy="selectin")

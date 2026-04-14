@@ -7,126 +7,19 @@ import { useRouter } from 'next/navigation';
 type IntakeMode = 'prompt' | 'github' | 'paste';
 
 const INTAKE_OPTIONS: { mode: IntakeMode; icon: string; title: string; desc: string }[] = [
-  { mode: 'prompt',  icon: '💡', title: 'Describe It',  desc: 'Tell us what to build — Claude will interview you for the full spec' },
-  { mode: 'github',  icon: '🔗', title: 'GitHub Repo',  desc: 'Import an existing repo — analyze, strengthen, and harden it' },
-  { mode: 'paste',   icon: '📋', title: 'Paste Code',   desc: 'Paste files directly — we detect the stack and get to work' },
+  { mode: 'prompt', icon: '💡', title: 'Describe It', desc: 'Tell us what to build — Claude will interview you for the full spec' },
+  { mode: 'github', icon: '🔗', title: 'GitHub Repo', desc: 'Import an existing repo — analyze, strengthen, and harden it' },
+  { mode: 'paste', icon: '📋', title: 'Paste Code', desc: 'Paste files directly — we detect the stack and get to work' },
 ];
 
 const STATUS_STYLE: Record<string, { bg: string; color: string }> = {
-  complete:    { bg: 'rgba(16,185,129,0.1)',  color: '#10b981' },
-  hardening:   { bg: 'rgba(255,71,87,0.1)',   color: '#ff4757' },
-  building:    { bg: 'rgba(59,130,246,0.1)',  color: '#3b82f6' },
-  judging:     { bg: 'rgba(249,115,22,0.1)',  color: '#f97316' },
-  interviewing:{ bg: 'rgba(0,212,255,0.1)',   color: '#00d4ff' },
-  spec_review: { bg: 'rgba(139,92,246,0.1)',  color: '#8b5cf6' },
+  complete: { bg: 'rgba(16,185,129,0.1)', color: '#10b981' },
+  hardening: { bg: 'rgba(255,71,87,0.1)', color: '#ff4757' },
+  building: { bg: 'rgba(59,130,246,0.1)', color: '#3b82f6' },
+  judging: { bg: 'rgba(249,115,22,0.1)', color: '#f97316' },
+  interviewing: { bg: 'rgba(0,212,255,0.1)', color: '#00d4ff' },
+  spec_review: { bg: 'rgba(139,92,246,0.1)', color: '#8b5cf6' },
 };
-
-function uniqueFilePath(path: string, used: Set<string>): string {
-  if (!used.has(path)) {
-    used.add(path);
-    return path;
-  }
-
-  const extensionIndex = path.lastIndexOf('.');
-  const base = extensionIndex > 0 ? path.slice(0, extensionIndex) : path;
-  const extension = extensionIndex > 0 ? path.slice(extensionIndex) : '';
-
-  let suffix = 2;
-  let candidate = `${base}-${suffix}${extension}`;
-  while (used.has(candidate)) {
-    suffix += 1;
-    candidate = `${base}-${suffix}${extension}`;
-  }
-  used.add(candidate);
-  return candidate;
-}
-
-function extractPathFromFenceInfo(info: string): string | null {
-  const trimmed = info.trim();
-  if (!trimmed) return null;
-
-  const keyMatch = trimmed.match(/(?:file|path)\s*[:=]\s*["']?([^"'\s]+)["']?/i);
-  if (keyMatch?.[1]) return keyMatch[1];
-
-  const titleMatch = trimmed.match(/title\s*=\s*["']([^"']+)["']/i);
-  if (titleMatch?.[1]) return titleMatch[1];
-
-  const tokens = trimmed
-    .split(/\s+/)
-    .map(token => token.replace(/^["']|["']$/g, ''))
-    .filter(Boolean);
-
-  return tokens.find(token => token.includes('/') || /\.[a-z0-9]+$/i.test(token)) || null;
-}
-
-function inferFilename(content: string, hint?: string | null, index = 0): string {
-  const trimmed = content.trim();
-  const lower = trimmed.toLowerCase();
-  const normalizedHint = (hint || '').trim().toLowerCase();
-
-  if (normalizedHint === 'json' || (trimmed.startsWith('{') && /"dependencies"\s*:/.test(trimmed))) {
-    return 'package.json';
-  }
-  if (/from\s+fastapi\b|import\s+fastapi\b|fastapi\(/i.test(trimmed)) {
-    return 'main.py';
-  }
-  if (normalizedHint === 'md' || normalizedHint === 'markdown' || lower.startsWith('# ')) {
-    return 'README.md';
-  }
-  if (normalizedHint === 'css' || /@tailwind\b|:root\s*\{|body\s*\{/i.test(trimmed)) {
-    return 'app/globals.css';
-  }
-  if (
-    normalizedHint === 'tsx'
-    || normalizedHint === 'jsx'
-    || /\buse client\b/.test(lower)
-    || /from\s+['"]next\//i.test(trimmed)
-    || /export\s+default\s+function/i.test(trimmed)
-    || /className=/.test(trimmed)
-  ) {
-    return normalizedHint === 'jsx' ? 'app/page.jsx' : 'app/page.tsx';
-  }
-  if (normalizedHint === 'ts' || normalizedHint === 'typescript') {
-    return `main${index > 0 ? `-${index + 1}` : ''}.ts`;
-  }
-  if (normalizedHint === 'js' || normalizedHint === 'javascript') {
-    return `main${index > 0 ? `-${index + 1}` : ''}.js`;
-  }
-  if (normalizedHint === 'py' || normalizedHint === 'python') {
-    return `main${index > 0 ? `-${index + 1}` : ''}.py`;
-  }
-  if (normalizedHint === 'html' || /<!doctype html>|<html/i.test(trimmed)) {
-    return 'index.html';
-  }
-
-  return `main${index > 0 ? `-${index + 1}` : ''}.txt`;
-}
-
-function parsePastedFiles(input: string): Record<string, string> {
-  const trimmed = input.trim();
-  if (!trimmed) return {};
-
-  const files: Record<string, string> = {};
-  const usedPaths = new Set<string>();
-  const blockPattern = /(?:^|\n)(?:(?:File|Path):\s*([^\n`]+)|([A-Za-z0-9_./@-]+\.[A-Za-z0-9]+))?\s*\n```([^\n`]*)\n([\s\S]*?)```/g;
-  let match: RegExpExecArray | null;
-  let blockIndex = 0;
-
-  while ((match = blockPattern.exec(trimmed)) !== null) {
-    const explicitPath = (match[1] || match[2] || '').trim();
-    const fenceInfo = (match[3] || '').trim();
-    const content = match[4].replace(/\n$/, '');
-    const inferredPath = explicitPath || extractPathFromFenceInfo(fenceInfo) || inferFilename(content, fenceInfo, blockIndex);
-    files[uniqueFilePath(inferredPath, usedPaths)] = content;
-    blockIndex += 1;
-  }
-
-  if (Object.keys(files).length > 0) {
-    return files;
-  }
-
-  return { [inferFilename(trimmed)]: trimmed };
-}
 
 export default function Home() {
   const [mode, setMode] = useState<IntakeMode>('prompt');
@@ -143,7 +36,7 @@ export default function Home() {
     fetch(`${API}/sessions?limit=6`)
       .then(r => r.ok ? r.json() : [])
       .then(setSessions)
-      .catch(() => {});
+      .catch(() => { });
   }, [API]);
 
   const handleStart = async () => {
@@ -164,7 +57,7 @@ export default function Home() {
         await fetch(`${API}/sessions/${session.id}/intake`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ files: parsePastedFiles(pastedCode) }),
+          body: JSON.stringify({ files: { 'main.py': pastedCode } }),
         });
       }
 
@@ -245,17 +138,12 @@ export default function Home() {
             />
           )}
           {mode === 'paste' && (
-            <>
-              <textarea
-                className="input-field min-h-[180px] resize-none terminal-text text-xs"
-                placeholder={'// Paste a file, or multiple fenced blocks\n// Example:\n// File: app/page.tsx\n// ```tsx\n// ...\n// ```'}
-                value={pastedCode}
-                onChange={e => setPastedCode(e.target.value)}
-              />
-              <p className="mt-3 text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
-                Paste a single file directly, or use blocks like <code>File: app/page.tsx</code> followed by fenced code for multi-file intake.
-              </p>
-            </>
+            <textarea
+              className="input-field min-h-[180px] resize-none terminal-text text-xs"
+              placeholder="// Paste your code here…"
+              value={pastedCode}
+              onChange={e => setPastedCode(e.target.value)}
+            />
           )}
 
           <button
@@ -279,9 +167,9 @@ export default function Home() {
       {/* ── Feature Cards ────────────────────────────────── */}
       <div className="w-full max-w-4xl grid grid-cols-3 gap-5 mb-24">
         {[
-          { icon: '🤖', title: 'Reverse Interview',   desc: 'Claude captures full requirements through intelligent Q&A' },
-          { icon: '⚔️', title: 'Dual Builder Race',   desc: 'Multiple AI providers build in parallel — Claude picks the winner' },
-          { icon: '🛡️', title: 'Mark II Hardening',  desc: 'Adversarial swarm attacks harden your code for production' },
+          { icon: '🤖', title: 'Reverse Interview', desc: 'Claude captures full requirements through intelligent Q&A' },
+          { icon: '⚔️', title: 'Dual Builder Race', desc: 'Multiple AI providers build in parallel — Claude picks the winner' },
+          { icon: '🛡️', title: 'Mark II Hardening', desc: 'Adversarial swarm attacks harden your code for production' },
         ].map(f => (
           <div key={f.title} className="glass-card p-6 text-center">
             <div className="text-3xl mb-4">{f.icon}</div>

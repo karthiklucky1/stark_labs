@@ -61,13 +61,13 @@ export function ArtifactsViewer({ sessionId }: { sessionId: string }) {
           <button
             key={name}
             onClick={() => setSelectedFile(name)}
-            className={`text-left px-4 py-3 transition-all relative group ${
-              selectedFile === name 
-                ? 'bg-white/5 border-white/10 text-white' 
+            className={`text-left px-4 py-3 rounded-xl transition-all relative group ${
+              selectedFile === name
+                ? 'bg-white/5 border-white/10 text-white shadow-[0_0_0_1px_rgba(255,255,255,0.04),0_0_18px_rgba(255,255,255,0.06)]'
                 : 'bg-black/20 border-white/5 text-slate-500 hover:border-white/10 hover:text-slate-300'
             } border`}
           >
-            {selectedFile === name && <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-white" />}
+            {selectedFile === name && <div className="absolute left-0 top-2 bottom-2 w-[2px] rounded-full bg-white" />}
             <span className="text-[10px] font-mono truncate block lowercase">{name}</span>
           </button>
         ))}

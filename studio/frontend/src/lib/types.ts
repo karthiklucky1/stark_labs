@@ -6,6 +6,9 @@ export interface Session {
   id: string;
   intake_mode: 'prompt' | 'github' | 'zip' | 'paste';
   profile_type: string | null;
+  build_mode?: 'fast' | 'balanced' | 'max_quality';
+  planned_builders?: string[];
+  architecture_json?: Record<string, unknown>;
   preview_mode?: 'iframe' | 'api_playground' | 'none' | null;
   status: SessionStatus;
   github_repo_url: string | null;
@@ -41,9 +44,12 @@ export interface BuildCandidate {
   model: string;
   status: string;
   score: number | null;
+  build_duration_ms?: number | null;
   is_baseline: boolean;
   preview_url: string | null;
   build_log: string;
+  module_scope_json?: Record<string, unknown>;
+  review_notes_json?: Array<Record<string, unknown>>;
   candidate_format: string;
   patch_summary: string | null;
   created_at: string;
@@ -72,7 +78,9 @@ export interface MarkRun {
   mark_number: number;
   mark_name: string;
   passed: boolean;
+  result_type?: 'passed' | 'breach' | 'inconclusive';
   failure_type: string | null;
+  rejection_reason?: string | null;
   swarm_report_json: Record<string, unknown>;
   patch_summary: string | null;
   repair_provider: string | null;

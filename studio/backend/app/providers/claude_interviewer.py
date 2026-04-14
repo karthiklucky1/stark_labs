@@ -118,12 +118,19 @@ class ClaudeInterviewer:
         )
 
         content = self._extract_text(response)
-        return {
+        result = {
             "role": "assistant",
             "content": content,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "spec_ready": self._is_spec_ready(content),
         }
+        if result["spec_ready"]:
+            spec = self._extract_spec_json(content)
+            if spec:
+                result["spec"] = spec
+            else:
+                result["spec_ready"] = False
+        return result
 
     async def continue_interview(
         self,

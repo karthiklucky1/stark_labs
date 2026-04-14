@@ -18,6 +18,10 @@ class SessionCreate(BaseModel):
         ..., pattern="^(prompt|github|zip|paste)$",
         description="How the user is providing input",
     )
+    build_mode: str = Field(
+        "balanced", pattern="^(fast|balanced|max_quality)$",
+        description="How many builders to use for this session",
+    )
     prompt: Optional[str] = Field(None, description="Initial user prompt (for prompt mode)")
     github_url: Optional[str] = Field(None, description="GitHub repo URL (for github mode)")
 
@@ -33,6 +37,9 @@ class SessionResponse(BaseModel):
     id: uuid.UUID
     intake_mode: str
     profile_type: Optional[str]
+    build_mode: str = "balanced"
+    planned_builders: list[str] = Field(default_factory=list)
+    architecture_json: dict[str, Any] = Field(default_factory=dict)
     preview_mode: Optional[str] = None
     status: str
     github_repo_url: Optional[str]
@@ -99,9 +106,12 @@ class CandidateResponse(BaseModel):
     model: str
     status: str
     score: Optional[float]
+    build_duration_ms: Optional[float]
     is_baseline: bool
     preview_url: Optional[str]
     build_log: str
+    module_scope_json: dict[str, Any] = Field(default_factory=dict)
+    review_notes_json: list[dict[str, Any]] = Field(default_factory=list)
     candidate_format: str
     patch_summary: Optional[str]
     created_at: datetime
@@ -151,7 +161,9 @@ class MarkRunResponse(BaseModel):
     mark_number: int
     mark_name: str
     passed: bool
+    result_type: Optional[str] = None
     failure_type: Optional[str]
+    rejection_reason: Optional[str]
     swarm_report_json: dict
     patch_summary: Optional[str]
     repair_provider: Optional[str]

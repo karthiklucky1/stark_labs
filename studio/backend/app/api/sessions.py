@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session_factory, get_session
@@ -37,15 +38,35 @@ from app.schemas.session import (
 from app.schemas.showcase import ShowcaseResponse
 from app.schemas.events import ChangeRequestEvent, PreviewUpdateEvent, SessionStatusEvent
 from app.services.orchestrator import orchestrator
+from app.services.nextjs_repair import repair_nextjs_project_files
 from app.services.profiles import detect_profile, get_profile
 from app.services.sandbox import sandbox_manager
 from app.services.showcase import showcase_service
+from app.settings import settings
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 # Tracks session IDs currently running a build or hardening task (in-process guard)
 _active_tasks: set[uuid.UUID] = set()
 _active_preview_repairs: set[uuid.UUID] = set()
+_preview_repair_backoff_until: dict[uuid.UUID, float] = {}
+_preview_failure_counts: dict[uuid.UUID, int] = {}
+_PREVIEW_REPAIR_COOLDOWN_S = 45.0
+_PREVIEW_FAILURE_THRESHOLD = 2
+_INCONCLUSIVE_MARKERS = (
+    "request failed",
+    "probe synthesis failed",
+    "judge unavailable",
+    "judge error",
+    "readtimeout",
+    "timed out",
+    "does not show",
+    "not evidence",
+    "no confirmed security bypass",
+    "normal page load",
+    "generic html",
+    "app shell",
+)
 
 
 async def _run_and_clear(coro_fn, session_id: uuid.UUID) -> None:
@@ -90,16 +111,23 @@ def _resolve_preview_runtime(
         blueprint=spec.blueprint_json if spec else None,
     )
     startup_cmd = profile.startup_command
-    health_path = profile.get_smoke_test_config().get("health_endpoint", "/health") or "/health"
+    smoke_config = profile.get_smoke_test_config()
+    preview_mode = profile.preview_mode
+    health_path = smoke_config.get("health_endpoint", "/health") or "/health"
+    page_path = smoke_config.get("page_endpoint", "/") or "/"
 
     if files and (not startup_cmd or profile.name in {"dynamic_profile", "unsupported"}):
         detected = detect_profile(files)
         if detected.name != "unsupported":
             startup_cmd = detected.startup_command
+            detected_smoke_config = detected.get_smoke_test_config()
+            preview_mode = detected.preview_mode
             if profile.name == "unsupported":
-                health_path = detected.get_smoke_test_config().get("health_endpoint", health_path) or health_path
+                health_path = detected_smoke_config.get("health_endpoint", health_path) or health_path
+                page_path = detected_smoke_config.get("page_endpoint", page_path) or page_path
 
-    return startup_cmd, health_path
+    probe_path = page_path if preview_mode == "iframe" else health_path
+    return startup_cmd, probe_path
 
 
 def _resolve_preview_mode(
@@ -122,76 +150,18 @@ def _resolve_preview_mode(
     return preview_mode
 
 
-def _repair_nextjs_alias_config(files: dict[str, str] | None) -> tuple[dict[str, str], bool]:
-    normalized_files = dict(files or {})
-    if not normalized_files:
-        return normalized_files, False
-    if detect_profile(normalized_files).name != "nextjs_webapp":
-        return normalized_files, False
-
-    files_changed = False
-    uses_alias_imports = any(
-        isinstance(content, str) and "@/" in content
-        for content in normalized_files.values()
+def _session_response(
+    session: ProjectSession,
+    *,
+    preview_mode: str | None = None,
+) -> SessionResponse:
+    response = SessionResponse.model_validate(session)
+    return response.model_copy(
+        update={
+            "preview_mode": preview_mode,
+            "planned_builders": orchestrator.get_planned_builders(session.build_mode),
+        }
     )
-    has_typescript_sources = any(
-        path.endswith((".ts", ".tsx"))
-        for path in normalized_files
-    )
-
-    if has_typescript_sources and "tsconfig.json" not in normalized_files:
-        normalized_files["tsconfig.json"] = json.dumps(
-            {
-                "compilerOptions": {
-                    "target": "ES2017",
-                    "lib": ["dom", "dom.iterable", "esnext"],
-                    "allowJs": True,
-                    "skipLibCheck": True,
-                    "strict": False,
-                    "noEmit": True,
-                    "esModuleInterop": True,
-                    "module": "esnext",
-                    "moduleResolution": "bundler",
-                    "resolveJsonModule": True,
-                    "isolatedModules": True,
-                    "jsx": "preserve",
-                    "incremental": True,
-                    "plugins": [{"name": "next"}],
-                    "baseUrl": ".",
-                    "paths": {
-                        "@/*": ["./*"],
-                    },
-                },
-                "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-                "exclude": ["node_modules"],
-            },
-            indent=2,
-        ) + "\n"
-        files_changed = True
-
-    if has_typescript_sources and "next-env.d.ts" not in normalized_files:
-        normalized_files["next-env.d.ts"] = (
-            "/// <reference types=\"next\" />\n"
-            "/// <reference types=\"next/image-types/global\" />\n"
-            "\n"
-        )
-        files_changed = True
-
-    if uses_alias_imports and not has_typescript_sources and "jsconfig.json" not in normalized_files:
-        normalized_files["jsconfig.json"] = json.dumps(
-            {
-                "compilerOptions": {
-                    "baseUrl": ".",
-                    "paths": {
-                        "@/*": ["./*"],
-                    },
-                },
-            },
-            indent=2,
-        ) + "\n"
-        files_changed = True
-
-    return normalized_files, files_changed
 
 
 def _normalize_preview_path(path: str) -> str:
@@ -203,6 +173,31 @@ def _normalize_preview_path(path: str) -> str:
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
     return normalized
+
+
+def _derive_mark_result_type(mark_run: MarkRun) -> str:
+    if mark_run.passed:
+        return "passed"
+
+    summary = (mark_run.swarm_report_json or {}).get("summary") or {}
+    stored = summary.get("result_type")
+    if stored in {"passed", "breach", "inconclusive"}:
+        return str(stored)
+
+    phases = (mark_run.swarm_report_json or {}).get("phases") or []
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        outcome = str(((phase.get("metrics") or {}).get("outcome")) or "").lower()
+        if outcome in {"execution_failed", "judge_unavailable", "probe_synthesis_failed", "inconclusive"}:
+            return "inconclusive"
+
+    joined = f"{mark_run.failure_type or ''}\n{mark_run.rejection_reason or ''}".lower()
+    if (mark_run.failure_type or "") == "AttackExecutionFailure":
+        return "inconclusive"
+    if any(marker in joined for marker in _INCONCLUSIVE_MARKERS):
+        return "inconclusive"
+    return "breach"
 
 
 async def _resolve_preview_state(
@@ -222,6 +217,14 @@ async def _resolve_preview_state(
     if not baseline:
         return {"session_id": str(session_id), "preview_url": None, "status": "unavailable"}
 
+    if session.status == "hardening":
+        return {
+            "session_id": str(session_id),
+            "preview_url": baseline.preview_url,
+            "status": "paused",
+            "detail": "Preview is temporarily paused while hardening reuses the sandbox",
+        }
+
     is_alive = await sandbox_manager.is_sandbox_alive(baseline.sandbox_id)
     if not is_alive:
         background_tasks.add_task(orchestrator.restart_sandbox, session_id)
@@ -240,35 +243,53 @@ async def _resolve_preview_state(
     )
     spec = result.scalar_one_or_none()
 
+    repair_files, files_changed = repair_nextjs_project_files(baseline.files_json or {})
+    if files_changed:
+        background_tasks.add_task(_restart_preview_process, session_id)
+        return {
+            "session_id": str(session_id),
+            "preview_url": baseline.preview_url,
+            "status": "restoring",
+            "detail": "Repairing generated Next.js project files and restarting preview",
+        }
+
     startup_cmd, health_path = _resolve_preview_runtime(
         session,
         spec,
-        baseline.files_json or {},
+        repair_files,
     )
     canonical_preview_url = await sandbox_manager.get_service_url_for_command(
         baseline.sandbox_id,
         startup_cmd,
         health_path=health_path,
-        files=baseline.files_json or {},
+        files=repair_files,
     )
+    effective_preview_url = canonical_preview_url or baseline.preview_url
 
-    if canonical_preview_url != baseline.preview_url:
-        baseline.preview_url = canonical_preview_url
-        await db.flush()
-
-    if not await sandbox_manager.is_service_available(canonical_preview_url, health_path=health_path):
-        if session_id not in _active_preview_repairs:
+    if not await sandbox_manager.is_service_available(effective_preview_url, health_path=health_path):
+        now = time.monotonic()
+        failures = _preview_failure_counts.get(session_id, 0) + 1
+        _preview_failure_counts[session_id] = failures
+        if (
+            failures >= _PREVIEW_FAILURE_THRESHOLD
+            and
+            session_id not in _active_preview_repairs
+            and now >= _preview_repair_backoff_until.get(session_id, 0.0)
+        ):
+            _preview_repair_backoff_until[session_id] = now + _PREVIEW_REPAIR_COOLDOWN_S
             background_tasks.add_task(_restart_preview_process, session_id)
         return {
             "session_id": str(session_id),
-            "preview_url": canonical_preview_url,
+            "preview_url": effective_preview_url,
             "status": "restoring",
             "detail": "Preview process not responding, restarting service",
         }
 
+    _preview_failure_counts.pop(session_id, None)
+    _preview_repair_backoff_until.pop(session_id, None)
     return {
         "session_id": str(session_id),
-        "preview_url": canonical_preview_url,
+        "preview_url": effective_preview_url,
         "status": "active",
     }
 
@@ -304,7 +325,7 @@ async def _restart_preview_process(session_id: uuid.UUID) -> None:
             )
             spec = spec_result.scalar_one_or_none()
 
-            repair_files, files_changed = _repair_nextjs_alias_config(baseline.files_json or {})
+            repair_files, files_changed = repair_nextjs_project_files(baseline.files_json or {})
             if files_changed:
                 baseline.files_json = repair_files
 
@@ -406,7 +427,8 @@ async def list_sessions(
         .order_by(ProjectSession.created_at.desc())
         .limit(limit)
     )
-    return result.scalars().all()
+    sessions = list(result.scalars().all())
+    return [_session_response(session) for session in sessions]
 
 
 # ── POST /sessions ─────────────────────────────────────────
@@ -420,6 +442,7 @@ async def create_session(
     """Create a new project session and immediately start the reverse interview."""
     session = ProjectSession(
         intake_mode=payload.intake_mode,
+        build_mode=payload.build_mode,
         original_prompt=payload.prompt,
         github_repo_url=payload.github_url,
         status="created",
@@ -438,7 +461,7 @@ async def create_session(
     if payload.intake_mode in ("prompt", "github") and (payload.prompt or payload.github_url):
         background_tasks.add_task(orchestrator.start_interview, session.id)
 
-    return session
+    return _session_response(session)
 
 
 # ── POST /sessions/{id}/intake ─────────────────────────────
@@ -488,7 +511,7 @@ async def submit_intake(
     # Start interview with the uploaded context
     background_tasks.add_task(orchestrator.start_interview, session.id)
 
-    return session
+    return _session_response(session)
 
 
 # ── GET /sessions/{id}/interview ────────────────────────────
@@ -711,7 +734,7 @@ async def get_latest_session(
     session = result.scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="No sessions found")
-    return session
+    return _session_response(session)
 
 
 # ── GET /sessions/{id} ────────────────────────────────────
@@ -725,13 +748,33 @@ async def get_session_detail(
     """Get full session state. Auto-resumes building/hardening tasks if orphaned or stalled."""
     from datetime import datetime, timezone
     session = await _get_session_or_404(session_id, db)
-    
+
+    latest_mark_result = await db.execute(
+        select(MarkRun)
+        .where(MarkRun.session_id == session_id)
+        .order_by(MarkRun.created_at.desc())
+    )
+    latest_mark = latest_mark_result.scalars().first()
+
+    latest_activity = session.updated_at
+    if latest_mark and latest_mark.created_at and (
+        latest_activity is None or latest_mark.created_at > latest_activity
+    ):
+        latest_activity = latest_mark.created_at
+
     # Staleness threshold (10 minutes)
     is_stale = False
-    if session.updated_at:
-        delta = datetime.now(timezone.utc) - session.updated_at.replace(tzinfo=timezone.utc)
-        if delta.total_seconds() > 600: # 10 mins
+    if latest_activity:
+        delta = datetime.now(timezone.utc) - latest_activity.replace(tzinfo=timezone.utc)
+        if delta.total_seconds() > 600:  # 10 mins
             is_stale = True
+
+    mark_count = await db.scalar(
+        select(func.count())
+        .select_from(MarkRun)
+        .where(MarkRun.session_id == session_id)
+    )
+    hardening_exhausted = (mark_count or 0) >= settings.max_marks
 
     # Auto-resume: only kick off if NOT already active in this process AND truly stale
     # (stale = status stuck for >10 min without update, e.g. after server restart)
@@ -742,7 +785,7 @@ async def get_session_detail(
         _queue_session_task_once(background_tasks, session_id, orchestrator.start_build)
         logger.info("Auto-resuming stale building session %s", session_id)
 
-    elif session.status == "hardening" and should_resume:
+    elif session.status == "hardening" and should_resume and not hardening_exhausted:
         _queue_session_task_once(background_tasks, session_id, orchestrator.start_hardening)
         logger.info("Auto-resuming stale hardening session %s", session_id)
 
@@ -766,8 +809,7 @@ async def get_session_detail(
         baseline.files_json if baseline else None,
     )
 
-    response = SessionResponse.model_validate(session)
-    return response.model_copy(update={"preview_mode": preview_mode})
+    return _session_response(session, preview_mode=preview_mode)
 
 
 # ── GET /sessions/{id}/events ──────────────────────────────
@@ -879,7 +921,9 @@ async def get_candidates(
     """Get all build candidates for a session."""
     await _get_session_or_404(session_id, db)
     result = await db.execute(
-        select(BuildCandidate).where(BuildCandidate.session_id == session_id)
+        select(BuildCandidate)
+        .where(BuildCandidate.session_id == session_id)
+        .order_by(BuildCandidate.created_at.asc())
     )
     candidates = list(result.scalars().all())
     return [
@@ -890,7 +934,14 @@ async def get_candidates(
             "status": c.status,
             "is_baseline": c.is_baseline,
             "score": c.score,
+            "build_duration_ms": c.build_duration_ms,
             "build_log": c.build_log,
+            "module_scope_json": c.module_scope_json or {},
+            "review_notes_json": c.review_notes_json or [],
+            "candidate_format": c.candidate_format,
+            "patch_summary": c.patch_summary,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
         }
         for c in candidates
     ]
@@ -917,6 +968,7 @@ async def get_session_marks(
             "mark_number": r.mark_number,
             "mark_name": r.mark_name,
             "passed": r.passed,
+            "result_type": _derive_mark_result_type(r),
             "failure_type": r.failure_type,
             "rejection_reason": r.rejection_reason,
             "patch_summary": r.patch_summary,

@@ -7,6 +7,8 @@ interface PreviewSystemProps {
   previewUrl: string | null;
   profileType: string | null;
   previewMode?: 'iframe' | 'api_playground' | 'none' | null;
+  previewStatus?: string | null;
+  previewDetail?: string | null;
 }
 
 interface ApiEndpoint {
@@ -16,27 +18,31 @@ interface ApiEndpoint {
 
 type UrlState = 'checking' | 'alive' | 'dead' | 'none';
 
-export default function PreviewSystem({ sessionId, previewUrl, profileType, previewMode }: PreviewSystemProps) {
+export default function PreviewSystem({
+  sessionId,
+  previewUrl,
+  profileType,
+  previewMode,
+  previewStatus,
+  previewDetail,
+}: PreviewSystemProps) {
   const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
   const [viewport, setViewport] = useState<'mobile' | 'tablet' | 'desktop'>('desktop');
   const [endpoints, setEndpoints] = useState<ApiEndpoint[]>([]);
   const [activeEndpointKey, setActiveEndpointKey] = useState<string>('GET /');
   const [response, setResponse] = useState<any>(null);
   const [loading, setLoading] = useState(false);
-  const [urlState, setUrlState] = useState<UrlState>('none');
-
-  // Check if the sandbox URL is actually reachable
-  useEffect(() => {
-    if (!previewUrl) { setUrlState('none'); return; }
-    setUrlState('checking');
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    fetch(previewUrl, { signal: controller.signal, mode: 'no-cors' })
-      .then(() => setUrlState('alive'))
-      .catch(() => setUrlState('dead'))
-      .finally(() => clearTimeout(timeout));
-    return () => { clearTimeout(timeout); controller.abort(); };
-  }, [previewUrl]);
+  const previewIsReady = previewStatus === 'active';
+  const urlState: UrlState =
+    !previewUrl
+      ? 'none'
+      : previewIsReady
+      ? 'alive'
+      : previewStatus === 'restoring'
+      ? 'checking'
+      : previewStatus === 'paused'
+      ? 'checking'
+      : 'checking';
 
   const isApiPreview = previewMode
     ? previewMode === 'api_playground'
@@ -54,7 +60,7 @@ export default function PreviewSystem({ sessionId, previewUrl, profileType, prev
 
   // Auto-discover endpoints for APIs when sandbox is alive
   useEffect(() => {
-    if (isApiPreview && previewUrl && urlState === 'alive') {
+    if (isApiPreview && previewUrl && previewIsReady) {
       fetch(`${API}/sessions/${sessionId}/preview/openapi`)
         .then(r => r.ok ? r.json() : null)
         .then(spec => {
@@ -70,7 +76,7 @@ export default function PreviewSystem({ sessionId, previewUrl, profileType, prev
         })
         .catch(() => {});
     }
-  }, [API, isApiPreview, previewUrl, sessionId, urlState]);
+  }, [API, isApiPreview, previewIsReady, previewUrl, sessionId]);
 
   const triggerRequest = async () => {
     if (!previewUrl || !activeEndpoint) return;
@@ -109,6 +115,29 @@ export default function PreviewSystem({ sessionId, previewUrl, profileType, prev
     );
   }
 
+  if (!previewIsReady) {
+    const title = previewStatus === 'paused' ? 'Preview Paused' : 'Restoring Preview';
+    const detail =
+      previewDetail
+      || (previewStatus === 'paused'
+        ? 'Hardening is using the sandbox right now. Preview will come back after it finishes.'
+        : 'The sandbox service is starting up. Preview will appear here once it is ready.');
+    return (
+      <div className="flex-1 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
+        <div className="text-center p-8 max-w-[280px]">
+          <div className="w-10 h-10 rounded-xl flex items-center justify-center mx-auto mb-4"
+            style={{ background: 'rgba(0,212,255,0.1)', border: '1px solid rgba(0,212,255,0.18)' }}>
+            <span className="text-sm" style={{ color: 'var(--stark-cyan)' }}>⟳</span>
+          </div>
+          <p className="text-xs font-semibold mb-1 text-white">{title}</p>
+          <p className="text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+            {detail}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   // Checking
   if (urlState === 'checking') {
     return (
@@ -116,29 +145,6 @@ export default function PreviewSystem({ sessionId, previewUrl, profileType, prev
         <div className="text-center p-8">
           <div className="status-dot mx-auto mb-3" style={{ background: 'var(--stark-cyan)', animation: 'pulse-glow 1s ease-in-out infinite' }} />
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>Connecting to sandbox…</p>
-        </div>
-      </div>
-    );
-  }
-
-  // Dead sandbox
-  if (urlState === 'dead') {
-    return (
-      <div className="flex-1 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
-        <div className="text-center p-8 max-w-[260px]">
-          <div className="w-10 h-10 rounded-xl flex items-center justify-center mx-auto mb-4"
-            style={{ background: 'rgba(255,71,87,0.1)', border: '1px solid rgba(255,71,87,0.2)' }}>
-            <span className="text-sm" style={{ color: 'var(--accent-red)' }}>✕</span>
-          </div>
-          <p className="text-xs font-semibold mb-1 text-white">Sandbox Expired</p>
-          <p className="text-xs leading-relaxed mb-4" style={{ color: 'var(--text-muted)' }}>
-            Cloud sandbox timed out. The built code is available in the Delivery tab.
-          </p>
-          <a href={previewUrl} target="_blank" rel="noreferrer"
-            className="text-xs px-3 py-1.5 rounded-lg font-semibold"
-            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', color: 'var(--text-secondary)' }}>
-            Try direct URL ↗
-          </a>
         </div>
       </div>
     );

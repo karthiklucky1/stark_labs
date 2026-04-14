@@ -39,12 +39,15 @@ class BuildCandidate(Base, TimestampMixin):
 
     # Scoring
     score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    build_duration_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     is_baseline: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Artifacts
     files_json: Mapped[dict] = mapped_column(JSON, default=dict)  # {filepath: content}
     build_log: Mapped[str] = mapped_column(Text, default="")
     test_results_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    module_scope_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    review_notes_json: Mapped[list] = mapped_column(JSON, default=list)
 
     # Patch metadata (for hardening iterations)
     candidate_format: Mapped[str] = mapped_column(String(64), default="generated_source")

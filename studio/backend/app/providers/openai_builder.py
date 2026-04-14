@@ -36,6 +36,51 @@ def _strip_code_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}\n... [truncated]"
+
+
+def _describe_exception(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message:
+        return f"{exc.__class__.__name__}: {message}"
+    return exc.__class__.__name__
+
+
+def _format_context_files(
+    context_files: dict[str, str],
+    *,
+    target_file: str,
+    max_files: int = 4,
+    max_chars: int = 900,
+) -> str:
+    if not context_files:
+        return "(no additional context files)"
+
+    sections: list[str] = []
+    for name, content in context_files.items():
+        if name == target_file:
+            continue
+        sections.append(f"### {name}\n```\n{_truncate_text(content, max_chars)}\n```")
+        if len(sections) >= max_files:
+            break
+    return "\n\n".join(sections) if sections else "(no additional context files)"
+
+
+def _format_file_manifest(source_files: dict[str, str], max_files: int = 40) -> str:
+    if not source_files:
+        return "(no files)"
+    names = sorted(source_files.keys())
+    listed = names[:max_files]
+    manifest = "\n".join(f"- {name}" for name in listed)
+    omitted = len(names) - len(listed)
+    if omitted > 0:
+        manifest += f"\n- ... {omitted} additional files omitted"
+    return manifest
+
+
 BUILD_SYSTEM_PROMPT = """You are Mark II Studio Builder — an expert software engineer.
 You build production-quality code from structured requirements.
 
@@ -87,8 +132,17 @@ Rules:
 PATCH_PROMPT = """The project failed with:
 {failure_type}
 
-## Source Files
+## Target File
+{target_file}
+
+## Target File Source
 {source_files}
+
+## Related Context Files
+{context_files}
+
+## Project File Manifest
+{file_manifest}
 
 ## Failure Details
 {failure_details}
@@ -165,13 +219,25 @@ class OpenAIBuilder:
         failure_details: str,
         requirements_json: dict,
         target_file: str = "main.py",
+        context_files: dict[str, str] | None = None,
     ) -> dict:
         """Generate a structured repair patch for failing code."""
         source_text = source_files.get(target_file, "Source missing")
+        related_context = _format_context_files(context_files or {}, target_file=target_file)
+        file_manifest = _format_file_manifest(source_files)
+
+        logger.info(
+            "OpenAI repair targeting %s with %d total files and %d related context files",
+            target_file,
+            len(source_files),
+            len(context_files or {}),
+        )
         
         prompt = PATCH_PROMPT.format(
             failure_type=failure_type,
             source_files=source_text,
+            context_files=related_context,
+            file_manifest=file_manifest,
             failure_details=failure_details,
             requirements_json=json.dumps(requirements_json, indent=2),
             target_file=target_file,
@@ -207,6 +273,6 @@ class OpenAIBuilder:
                 "patch_plan": plan_json,
             }
         except Exception as e:
-            logger.error("OpenAI failed to generate valid patch: %s", e)
-            # Placeholder for fallback logic — in production we might trigger a full rewrite
-            return {"files": source_files, "summary": "Repair failed", "error": str(e)}
+            error_detail = _describe_exception(e)
+            logger.error("OpenAI failed to generate valid patch: %s", error_detail)
+            return {"files": {}, "summary": "Repair failed", "error": error_detail}

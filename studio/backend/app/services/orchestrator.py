@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,8 +24,18 @@ from app.providers.openai_builder import OpenAIBuilder
 from app.providers.deepseek_builder import DeepSeekBuilder
 from app.providers.zhipu_builder import ZhipuBuilder
 from app.providers.claude_interviewer import ClaudeInterviewer
+from app.providers.openai_interviewer import OpenAIInterviewer
 from app.providers.claude_judge import ClaudeJudge
 from app.providers.ollama_builder import OllamaBuilder
+from app.services.assembly import (
+    build_deterministic_plan,
+    build_provider_requirements,
+    merge_synthesized_files,
+    request_peer_review,
+    request_provider_proposal,
+    synthesize_master_blueprint,
+)
+from app.services.nextjs_repair import repair_nextjs_project_files
 from app.services.profiles import detect_profile, get_profile
 from app.services.sandbox import sandbox_manager
 from app.services.hardening import hardening_service
@@ -67,6 +79,116 @@ def _resolve_runtime_profile(
     return profile, runtime_profile, startup_cmd, install_cmd, health_path
 
 
+def _truncate_text(value: Any, max_chars: int = 240) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}... [truncated]"
+
+
+def _compact_json(value: Any, *, max_items: int = 8, max_chars: int = 240) -> Any:
+    if isinstance(value, dict):
+        items = list(value.items())
+        compacted = {
+            key: _compact_json(item, max_items=max_items, max_chars=max_chars)
+            for key, item in items[:max_items]
+        }
+        omitted = len(items) - max_items
+        if omitted > 0:
+            compacted["_omitted"] = f"{omitted} additional fields omitted"
+        return compacted
+    if isinstance(value, list):
+        compacted = [
+            _compact_json(item, max_items=max_items, max_chars=max_chars)
+            for item in value[:max_items]
+        ]
+        omitted = len(value) - max_items
+        if omitted > 0:
+            compacted.append(f"... {omitted} additional items omitted")
+        return compacted
+    if isinstance(value, str):
+        return _truncate_text(value, max_chars=max_chars)
+    return value
+
+
+def _builder_focus(profile_name: str, provider: str) -> list[str]:
+    base_focus = [
+        "Keep the project runnable immediately with complete dependencies and a valid startup command.",
+        "Implement the highest-value user flow first and avoid placeholder-only files.",
+        "Prefer coherent, production-style structure over unnecessary abstraction.",
+    ]
+    profile_specific = {
+        "fastapi_service": [
+            "Prioritize request validation, status codes, concurrency safety, and clear API contracts.",
+            "Ensure health and core business endpoints are fully implemented and testable.",
+        ],
+        "nextjs_webapp": [
+            "Prioritize the main UI flow, responsive layout, and clean state handling.",
+            "Keep the app router structure correct and ensure the primary page works without dead links.",
+        ],
+    }
+    provider_specific = {
+        "openai": [
+            "Bias toward overall product coherence and polished primary flows.",
+        ],
+        "deepseek": [
+            "Bias toward deeper edge-case handling and stricter implementation correctness.",
+        ],
+        "zhipu": [
+            "Bias toward form completeness, validation consistency, and solid baseline UX states.",
+        ],
+        "ollama": [
+            "Bias toward a smaller but complete implementation with reliable local startup.",
+        ],
+    }
+    return base_focus + profile_specific.get(profile_name, []) + provider_specific.get(provider, [])
+
+
+def _compact_profile_instructions(profile_instructions: str) -> str:
+    lines = [line.rstrip() for line in profile_instructions.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    limited = lines[:18]
+    omitted = len(lines) - len(limited)
+    text = "\n".join(limited)
+    if omitted > 0:
+        text += f"\n... {omitted} additional instruction lines omitted"
+    return _truncate_text(text, max_chars=1800)
+
+
+def _build_builder_requirements(
+    spec: RequirementSpec,
+    profile,
+    provider: str,
+) -> dict[str, Any]:
+    requirements = spec.requirements_json or {}
+    blueprint = spec.blueprint_json or {}
+    startup_command = blueprint.get("startup_command") or profile.startup_command
+    install_command = blueprint.get("install_command") or profile.install_command
+
+    return {
+        "builder_brief_version": 1,
+        "project_summary": _truncate_text(spec.summary or "", max_chars=500),
+        "profile_type": profile.name,
+        "preview_mode": getattr(profile, "preview_mode", None),
+        "implementation_focus": _builder_focus(profile.name, provider),
+        "functional": _compact_json(requirements.get("functional", []), max_items=10, max_chars=220),
+        "routes_or_pages": _compact_json(requirements.get("routes_or_pages", []), max_items=10, max_chars=180),
+        "data_model": _compact_json(requirements.get("data_model", []), max_items=8, max_chars=200),
+        "security": _compact_json(requirements.get("security", []), max_items=8, max_chars=200),
+        "behavior": _compact_json(requirements.get("behavior", []), max_items=8, max_chars=200),
+        "technical": _compact_json(requirements.get("technical", []), max_items=8, max_chars=200),
+        "architecture": {
+            "tech_stack": _truncate_text(blueprint.get("tech_stack", ""), max_chars=280),
+            "install_command": install_command,
+            "startup_command": startup_command,
+            "preview_port": blueprint.get("preview_port"),
+            "planned_files": _compact_json(blueprint.get("file_tree", []), max_items=18, max_chars=120),
+            "builder_notes": _truncate_text(blueprint.get("instructions", ""), max_chars=900),
+        },
+    }
+
+
 class Orchestrator:
     """
     Master orchestrator implementing the session state machine.
@@ -82,14 +204,300 @@ class Orchestrator:
         self.zhipu_builder = ZhipuBuilder() if settings.has_zhipu else None
         self.ollama_builder = OllamaBuilder() if settings.has_ollama else None
         self.interviewer = ClaudeInterviewer() if settings.has_anthropic else None
+        self.fallback_interviewer = OpenAIInterviewer() if settings.openai_api_key else None
         self.judge = ClaudeJudge() if settings.has_anthropic else None
         self._session_locks: dict[uuid.UUID, asyncio.Lock] = {}
 
         logger.info(
-            "Orchestrator ready — OpenAI=%s, DeepSeek=%s, Zhipu=%s, Claude=%s, E2B=%s",
+            "Orchestrator ready — OpenAI=%s, DeepSeek=%s, Zhipu=%s, Claude=%s, OpenAIInterview=%s, E2B=%s",
             "✅", "✅" if self.deepseek_builder else "❌",
             "✅" if self.zhipu_builder else "❌",
-            "✅" if self.interviewer else "❌", "✅" if settings.has_e2b else "❌ (mock)",
+            "✅" if self.interviewer else "❌",
+            "✅" if self.fallback_interviewer else "❌",
+            "✅" if settings.has_e2b else "❌ (mock)",
+        )
+
+    def _available_builders(self) -> dict[str, tuple[str, object]]:
+        builders: dict[str, tuple[str, object]] = {
+            "openai": (settings.openai_builder_model, self.openai_builder),
+        }
+        if self.deepseek_builder:
+            builders["deepseek"] = (settings.deepseek_builder_model, self.deepseek_builder)
+        if self.zhipu_builder:
+            builders["zhipu"] = (settings.zhipu_builder_model, self.zhipu_builder)
+        if self.ollama_builder:
+            builders["ollama"] = (settings.ollama_builder_model, self.ollama_builder)
+        return builders
+
+    def get_planned_builders(self, build_mode: str | None) -> list[str]:
+        mode = build_mode or "balanced"
+        available = self._available_builders()
+        desired_by_mode = {
+            "fast": ["openai"],
+            "balanced": ["openai", "deepseek"],
+            "max_quality": ["openai", "deepseek", "zhipu", "ollama"],
+        }
+        desired = desired_by_mode.get(mode, desired_by_mode["balanced"])
+        return [provider for provider in desired if provider in available]
+
+    def _build_auto_spec_from_prompt(
+        self,
+        session: ProjectSession,
+        *,
+        user_answer: str | None = None,
+    ) -> dict[str, Any]:
+        prompt = (session.original_prompt or "").strip()
+        detail = (user_answer or "").strip()
+        combined = prompt if not detail else f"{prompt}\n\nAdditional user detail: {detail}"
+        functional = [combined or "Build the requested project."]
+        profile_hint = session.profile_type or "dynamic_profile"
+        framework_hint = "nextjs" if "next" in combined.lower() else "unknown"
+        return {
+            "summary": combined[:400] or "Auto-generated project specification",
+            "requirements": {
+                "functional": functional,
+                "routes_or_pages": [],
+                "data_model": [],
+                "security": [],
+                "behavior": [],
+                "technical": [],
+            },
+            "detected_framework": framework_hint,
+            "detected_profile": profile_hint,
+            "blueprint": {},
+        }
+
+    async def _interview_start_with_fallback(
+        self,
+        *,
+        initial_prompt: str | None,
+        code_files: dict[str, str] | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        errors: list[str] = []
+        if self.interviewer:
+            try:
+                return await self.interviewer.start_interview(
+                    initial_prompt=initial_prompt,
+                    code_files=code_files,
+                ), "claude"
+            except Exception as exc:
+                logger.warning("Claude interviewer failed on start_interview: %s", exc)
+                errors.append(f"Claude: {exc}")
+        if self.fallback_interviewer:
+            try:
+                return await self.fallback_interviewer.start_interview(
+                    initial_prompt=initial_prompt,
+                    code_files=code_files,
+                ), "openai"
+            except Exception as exc:
+                logger.warning("OpenAI interviewer failed on start_interview fallback: %s", exc)
+                errors.append(f"OpenAI: {exc}")
+        raise RuntimeError(" | ".join(errors) or "No interviewer available")
+
+    async def _interview_continue_with_fallback(
+        self,
+        *,
+        history: list[dict],
+        user_answer: str,
+    ) -> tuple[dict[str, Any], str]:
+        errors: list[str] = []
+        if self.interviewer:
+            try:
+                return await self.interviewer.continue_interview(
+                    history=history,
+                    user_answer=user_answer,
+                ), "claude"
+            except Exception as exc:
+                logger.warning("Claude interviewer failed on continue_interview: %s", exc)
+                errors.append(f"Claude: {exc}")
+        if self.fallback_interviewer:
+            try:
+                return await self.fallback_interviewer.continue_interview(
+                    history=history,
+                    user_answer=user_answer,
+                ), "openai"
+            except Exception as exc:
+                logger.warning("OpenAI interviewer failed on continue_interview fallback: %s", exc)
+                errors.append(f"OpenAI: {exc}")
+        raise RuntimeError(" | ".join(errors) or "No interviewer available")
+
+    async def _persist_architecture_state(self, session_id: uuid.UUID, architecture_json: dict[str, Any]) -> None:
+        async with async_session_factory() as db:
+            session = await self._get_session(db, session_id)
+            session.architecture_json = architecture_json
+            await db.commit()
+
+    async def _plan_architecture(
+        self,
+        *,
+        session_id: uuid.UUID,
+        spec: RequirementSpec,
+        profile,
+        planned_builders: list[str],
+        builder_catalog: dict[str, tuple[str, object]],
+    ) -> dict[str, Any]:
+        base_blueprint = dict(spec.blueprint_json or {})
+        deterministic_plan = build_deterministic_plan(
+            profile_type=profile.name,
+            base_blueprint=base_blueprint,
+            planned_builders=planned_builders,
+        )
+
+        architecture_json: dict[str, Any] = {
+            "version": 1,
+            "protocol": "assembly_v1",
+            "stage": "council",
+            "council_proposals": [],
+            "master_blueprint": deterministic_plan,
+            "peer_reviews": [],
+            "synthesis": {},
+        }
+        await self._persist_architecture_state(session_id, architecture_json)
+
+        proposal_tasks = []
+        for provider in planned_builders:
+            proposal_tasks.append(
+                request_provider_proposal(
+                    provider=provider,
+                    builder=builder_catalog[provider][1],
+                    profile_type=profile.name,
+                    requirements_json=spec.requirements_json or {},
+                    base_blueprint=base_blueprint,
+                    deterministic_module=deterministic_plan.get("provider_modules", {}).get(provider, {}),
+                )
+            )
+        proposal_results = await asyncio.gather(*proposal_tasks, return_exceptions=True)
+        council_proposals: list[dict[str, Any]] = []
+        for provider, proposal_result in zip(planned_builders, proposal_results):
+            if isinstance(proposal_result, Exception):
+                logger.warning("Council proposal failed for %s: %s", provider, proposal_result)
+                proposal = {
+                    "summary": f"{provider} proposal failed",
+                    "critical_files": [],
+                    "module_boundaries": [],
+                    "integration_risks": [str(proposal_result)],
+                    "peer_review_focus": [],
+                }
+            else:
+                proposal = proposal_result
+            council_proposals.append(
+                {
+                    "provider": provider,
+                    "model": builder_catalog[provider][0],
+                    "proposal": proposal,
+                }
+            )
+
+        master_blueprint = await synthesize_master_blueprint(
+            claude_client=self.judge.client if self.judge else None,
+            claude_model=self.judge.model if self.judge else None,
+            profile_type=profile.name,
+            requirements_json=spec.requirements_json or {},
+            base_blueprint=base_blueprint,
+            deterministic_plan=deterministic_plan,
+            council_proposals=council_proposals,
+        )
+        architecture_json = {
+            "version": 1,
+            "protocol": "assembly_v1",
+            "stage": "blueprint_complete",
+            "council_proposals": council_proposals,
+            "master_blueprint": master_blueprint,
+            "peer_reviews": [],
+            "synthesis": {},
+        }
+        await self._persist_architecture_state(session_id, architecture_json)
+        return architecture_json
+
+    async def _run_peer_reviews(
+        self,
+        *,
+        master_blueprint: dict[str, Any],
+        candidate_payloads: list[dict[str, Any]],
+        builder_catalog: dict[str, tuple[str, object]],
+    ) -> list[dict[str, Any]]:
+        candidate_map = {candidate["provider"]: candidate for candidate in candidate_payloads}
+        review_tasks = []
+        scheduled_pairs: list[dict[str, Any]] = []
+        review_pairs = master_blueprint.get("peer_review_pairs", [])
+        for pair in review_pairs:
+            reviewer = pair.get("reviewer")
+            target = pair.get("target")
+            if reviewer not in candidate_map or target not in candidate_map or reviewer not in builder_catalog:
+                continue
+            target_scope = master_blueprint.get("provider_modules", {}).get(target, {})
+            owned_files = set(target_scope.get("owned_files", []))
+            target_files = {
+                path: content
+                for path, content in (candidate_map[target].get("files_json") or {}).items()
+                if path in owned_files
+            }
+            review_tasks.append(
+                request_peer_review(
+                    reviewer=reviewer,
+                    reviewer_builder=builder_catalog[reviewer][1],
+                    target=target,
+                    master_blueprint=master_blueprint,
+                    target_scope=target_scope,
+                    target_files=target_files,
+                )
+            )
+            scheduled_pairs.append(pair)
+
+        if not review_tasks:
+            return []
+
+        review_results = await asyncio.gather(*review_tasks, return_exceptions=True)
+        finalized: list[dict[str, Any]] = []
+        for pair, review_result in zip(scheduled_pairs, review_results):
+            reviewer = pair.get("reviewer")
+            target = pair.get("target")
+            if isinstance(review_result, Exception):
+                review_payload = {
+                    "verdict": "concerns",
+                    "summary": f"{reviewer} review failed",
+                    "critical_issues": [str(review_result)],
+                    "interface_gaps": [],
+                    "suggested_followups": [],
+                }
+            else:
+                review_payload = review_result
+            finalized.append({"reviewer": reviewer, "target": target, "review": review_payload})
+        return finalized
+
+    async def _score_contributors(
+        self,
+        *,
+        session_id: uuid.UUID,
+        spec: RequirementSpec,
+        profile_name: str,
+        candidate_payloads: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], str, list[Any]]:
+        if len(candidate_payloads) == 1 or not self.judge:
+            only_provider = candidate_payloads[0]["provider"]
+            return (
+                {only_provider: {"total_weighted": 100.0}},
+                "Single contributor assembly; advisory scoring defaulted to 100.",
+                ["single contributor"],
+            )
+
+        judge_result = await self.judge.judge_candidates(
+            requirements_json=spec.requirements_json,
+            profile_type=profile_name,
+            candidates=[
+                {
+                    "files": payload["files_json"],
+                    "model": payload["model"],
+                    "test_results": payload.get("test_results_json", {}),
+                    "provider": payload["provider"],
+                }
+                for payload in candidate_payloads
+            ],
+        )
+        return (
+            judge_result.get("scores", {}) if isinstance(judge_result.get("scores"), dict) else {},
+            judge_result.get("reasoning", ""),
+            judge_result.get("criteria", []),
         )
 
     # ── Interview Phase ────────────────────────────────────
@@ -99,24 +507,19 @@ class Orchestrator:
         async with async_session_factory() as db:
             session = await self._get_session(db, session_id)
 
-            # If Claude is not available, auto-generate a basic spec from the prompt
-            if not self.interviewer:
+            # If no interview providers are available, auto-generate a basic spec from the prompt
+            if not self.interviewer and not self.fallback_interviewer:
                 session.status = "spec_review"
+                auto_spec = self._build_auto_spec_from_prompt(session)
                 spec = RequirementSpec(
                     session_id=session_id,
                     version=1,
-                    summary=session.original_prompt or "User-submitted project",
-                    requirements_json={
-                        "functional": [session.original_prompt or "Build the requested project"],
-                        "routes_or_pages": [],
-                        "data_model": [],
-                        "security": [],
-                        "behavior": [],
-                        "technical": [],
-                    },
+                    summary=auto_spec["summary"],
+                    requirements_json=auto_spec["requirements"],
                     interview_history=[],
-                    detected_framework="unknown",
-                    detected_profile="fastapi_service",
+                    detected_framework=auto_spec["detected_framework"],
+                    detected_profile=auto_spec["detected_profile"],
+                    blueprint_json=auto_spec["blueprint"],
                 )
                 db.add(spec)
                 await db.commit()
@@ -140,26 +543,83 @@ class Orchestrator:
                 data={"status": "interviewing"},
             ))
 
-            # Start interview based on intake mode
-            result = await self.interviewer.start_interview(
-                initial_prompt=session.original_prompt,
-            )
+            try:
+                result, source = await self._interview_start_with_fallback(
+                    initial_prompt=session.original_prompt,
+                    code_files=session.intake_files_json,
+                )
 
-            # Create initial requirement spec with interview history
-            spec = RequirementSpec(
-                session_id=session_id,
-                version=1,
-                interview_history=[result],
-            )
-            db.add(spec)
-            await db.commit()
+                if result.get("spec_ready") and result.get("spec"):
+                    parsed_spec = result["spec"]
+                    session.status = "spec_review"
+                    session.profile_type = parsed_spec.get("detected_profile")
 
-            await event_bus.publish(InterviewMessageEvent(
-                session_id=session_id,
-                data={"role": "assistant", "content": result["content"]},
-            ))
+                # Create initial requirement spec with interview history
+                spec = RequirementSpec(
+                    session_id=session_id,
+                    version=1,
+                    summary=parsed_spec.get("summary", "") if result.get("spec_ready") and result.get("spec") else "",
+                    requirements_json=parsed_spec.get("requirements", {}) if result.get("spec_ready") and result.get("spec") else {},
+                    interview_history=[result],
+                    detected_framework=parsed_spec.get("detected_framework") if result.get("spec_ready") and result.get("spec") else None,
+                    detected_profile=parsed_spec.get("detected_profile") if result.get("spec_ready") and result.get("spec") else None,
+                    blueprint_json=parsed_spec.get("blueprint", {}) if result.get("spec_ready") and result.get("spec") else {},
+                )
+                db.add(spec)
+                await db.commit()
 
-            return result
+                detail = "Interview started"
+                if source == "openai":
+                    detail = "Claude interviewer overloaded — using OpenAI fallback"
+                await event_bus.publish(SessionStatusEvent(
+                    session_id=session_id,
+                    data={"status": session.status, "detail": detail},
+                ))
+
+                await event_bus.publish(InterviewMessageEvent(
+                    session_id=session_id,
+                    data={"role": "assistant", "content": result["content"], "spec_ready": result.get("spec_ready")},
+                ))
+
+                return result
+            except Exception as exc:
+                logger.error("Interview startup failed for %s: %s", session_id, exc)
+                auto_spec = self._build_auto_spec_from_prompt(session)
+                session.status = "spec_review"
+                spec = RequirementSpec(
+                    session_id=session_id,
+                    version=1,
+                    summary=auto_spec["summary"],
+                    requirements_json=auto_spec["requirements"],
+                    interview_history=[{
+                        "role": "assistant",
+                        "content": "Interview services were overloaded, so Stark generated a draft spec from your prompt. Review it and continue from spec review.",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "spec_ready": True,
+                    }],
+                    detected_framework=auto_spec["detected_framework"],
+                    detected_profile=auto_spec["detected_profile"],
+                    blueprint_json=auto_spec["blueprint"],
+                )
+                db.add(spec)
+                await db.commit()
+
+                result = {
+                    "role": "assistant",
+                    "content": "Interview services were overloaded, so Stark generated a draft spec from your prompt. Review it and continue from spec review.",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "spec_ready": True,
+                    "spec": auto_spec,
+                }
+                await event_bus.publish(SessionStatusEvent(
+                    session_id=session_id,
+                    data={"status": "spec_review", "detail": "Interview overloaded — using draft spec"},
+                ))
+                await event_bus.publish(InterviewMessageEvent(
+                    session_id=session_id,
+                    data={"role": "assistant", "content": result["content"], "spec_ready": True},
+                ))
+                return result
 
     async def process_answer(self, session_id: uuid.UUID, user_answer: str) -> dict:
         """Process a user's interview answer."""
@@ -196,11 +656,23 @@ class Orchestrator:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
 
-                # Continue interview with Claude
-                response = await self.interviewer.continue_interview(
-                    history=history,
-                    user_answer=user_answer,
-                )
+                try:
+                    # Continue interview with fallback if needed
+                    response, source = await self._interview_continue_with_fallback(
+                        history=history,
+                        user_answer=user_answer,
+                    )
+                except Exception as exc:
+                    logger.error("Interview continuation failed for %s: %s", session_id, exc)
+                    auto_spec = self._build_auto_spec_from_prompt(session, user_answer=user_answer)
+                    response = {
+                        "role": "assistant",
+                        "content": "Interview services were overloaded, so Stark generated a draft spec from your prompt and latest answer. Review it and continue from spec review.",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "spec_ready": True,
+                        "spec": auto_spec,
+                    }
+                    source = "auto_spec"
 
                 # Update history with Claude's response
                 history.append(response)
@@ -221,6 +693,17 @@ class Orchestrator:
                     session.profile_type = parsed_spec.get("detected_profile")
 
                 await db.commit()
+
+            if source == "openai":
+                await event_bus.publish(SessionStatusEvent(
+                    session_id=session_id,
+                    data={"status": "interviewing", "detail": "Claude interviewer overloaded — using OpenAI fallback"},
+                ))
+            elif source == "auto_spec":
+                await event_bus.publish(SessionStatusEvent(
+                    session_id=session_id,
+                    data={"status": "spec_review", "detail": "Interview overloaded — using draft spec"},
+                ))
 
             if response.get("spec_ready"):
                 await event_bus.publish(SessionStatusEvent(
@@ -291,28 +774,46 @@ class Orchestrator:
                 spec = result.scalar_one_or_none()
                 profile = get_profile(session.profile_type or "unsupported", blueprint=spec.blueprint_json)
 
-            requirements = spec.requirements_json
-            profile_instructions = profile.get_builder_instructions()
+            full_requirements_size = len(str(spec.requirements_json or {}))
+            compact_profile_instructions = _compact_profile_instructions(profile.get_builder_instructions())
 
-            # Determine which builders to run
+            builder_catalog = self._available_builders()
+            planned_builders = self.get_planned_builders(session.build_mode)
             builders: list[tuple[str, str, object]] = [
-                ("openai", settings.openai_builder_model, self.openai_builder),
+                (provider, builder_catalog[provider][0], builder_catalog[provider][1])
+                for provider in planned_builders
             ]
-            if self.deepseek_builder:
-                builders.append(("deepseek", settings.deepseek_builder_model, self.deepseek_builder))
-            if self.zhipu_builder:
-                builders.append(("zhipu", settings.zhipu_builder_model, self.zhipu_builder))
-            if self.ollama_builder:
-                builders.append(("ollama", settings.ollama_builder_model, self.ollama_builder))
 
-            mode = "parallel" if len(builders) > 1 else "single (OpenAI only)"
+            mode = session.build_mode or "balanced"
+            if not builders:
+                raise ValueError(f"No builders available for build mode {mode}")
             await event_bus.publish(BuildProgressEvent(
                 session_id=session_id,
-                data={"provider": "both" if len(builders) > 1 else "openai", "status": "started", "detail": f"Build initiated — {mode}"},
+                data={
+                    "provider": "multi" if len(builders) > 1 else builders[0][0],
+                    "status": "started",
+                    "detail": f"Assembly initiated — {mode.replace('_', ' ')} mode with {', '.join(planned_builders)}",
+                },
+            ))
+            await event_bus.publish(SessionStatusEvent(
+                session_id=session_id,
+                data={"status": "building", "detail": "Council of Architects drafting master blueprint…"},
             ))
 
-            # Create sandboxes and run builds
-            # Check which providers still need to build
+            architecture_json = await self._plan_architecture(
+                session_id=session_id,
+                spec=spec,
+                profile=profile,
+                planned_builders=planned_builders,
+                builder_catalog=builder_catalog,
+            )
+            master_blueprint = architecture_json.get("master_blueprint", {})
+
+            await event_bus.publish(SessionStatusEvent(
+                session_id=session_id,
+                data={"status": "building", "detail": "Master blueprint locked — modular assembly starting"},
+            ))
+
             providers_to_build: list[tuple[str, str, object]] = []
             async with async_session_factory() as db:
                 for provider, model, builder in builders:
@@ -327,54 +828,73 @@ class Orchestrator:
                     else:
                         providers_to_build.append((provider, model, builder))
 
-            # If all providers already built, skip straight to judging
             if not providers_to_build:
-                logger.info("All candidates already built for %s — skipping to judging", session_id)
+                logger.info("All module contributors already built for %s — skipping to synthesis", session_id)
                 await self._judge_candidates(session_id)
                 return
 
             tasks = []
-            sandbox_ids = []
             for provider, model, builder in providers_to_build:
+                module_scope = master_blueprint.get("provider_modules", {}).get(provider, {})
+                module_name = module_scope.get("module_name") or f"{provider.title()} module"
 
-                # Emit "Initiating" event for each provider immediately
                 await event_bus.publish(BuildProgressEvent(
                     session_id=session_id,
-                    data={"provider": provider, "status": "started", "detail": f"Model {provider} initiating..."},
+                    data={"provider": provider, "status": "started", "detail": f"{provider}: Owning {module_name}"},
                 ))
-                await asyncio.sleep(0.05) # Pacing
+                await asyncio.sleep(0.05)
 
-                sandbox_id = await sandbox_manager.create_sandbox(profile.name, str(session_id))
-                sandbox_ids.append(sandbox_id)
-                
-                # Wrap the builder call to emit granular updates
-                async def _task_wrapper(p=provider, m=model, b=builder, sid=sandbox_id):
-                    await event_bus.publish(BuildProgressEvent(
-                        session_id=session_id,
-                        data={"provider": p, "status": "running", "detail": f"{p}: Thinking & Coding..."},
-                    ))
-                    res = await b.build_from_spec(
-                        requirements_json=requirements,
-                        profile_type=profile.name,
-                        profile_instructions=profile_instructions,
-                    )
-                    await event_bus.publish(BuildProgressEvent(
-                        session_id=session_id,
-                        data={"provider": p, "status": "running", "detail": f"{p}: Finalizing files..."},
-                    ))
-                    return res
+                async def _task_wrapper(p=provider, m=model, b=builder, scope=module_scope):
+                    started_at = time.perf_counter()
+                    try:
+                        scoped_requirements = _build_builder_requirements(spec, profile, p)
+                        assembly_requirements = build_provider_requirements(
+                            base_requirements=scoped_requirements,
+                            master_blueprint=master_blueprint,
+                            provider=p,
+                        )
+                        logger.info(
+                            "Dispatching %s assembly brief (%d chars scoped requirements vs %d original, %d chars instructions)",
+                            p,
+                            len(str(assembly_requirements)),
+                            full_requirements_size,
+                            len(compact_profile_instructions),
+                        )
+                        await event_bus.publish(BuildProgressEvent(
+                            session_id=session_id,
+                            data={"provider": p, "status": "running", "detail": f"{p}: Building owned module surface…"},
+                        ))
+                        res = await b.build_from_spec(
+                            requirements_json=assembly_requirements,
+                            profile_type=profile.name,
+                            profile_instructions=compact_profile_instructions,
+                        )
+                        await event_bus.publish(BuildProgressEvent(
+                            session_id=session_id,
+                            data={"provider": p, "status": "running", "detail": f"{p}: Packaging contribution…"},
+                        ))
+                        return {
+                            "result": res,
+                            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                            "module_scope": scope,
+                        }
+                    except Exception as exc:
+                        return {
+                            "error": str(exc),
+                            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                            "module_scope": scope,
+                        }
 
                 tasks.append(_task_wrapper())
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            logger.info("All parallel builds completed (success/fail count: %d)", len(results))
+            logger.info("All modular assembly builds completed (count: %d)", len(results))
 
-            # Process results
             async with async_session_factory() as db:
                 for idx, (provider, model, _builder) in enumerate(providers_to_build):
-                    sandbox_id = sandbox_ids[idx]
                     build_result = results[idx]
-                    logger.info("Processing results for builder: %s", provider)
+                    logger.info("Processing module contributor result for builder: %s", provider)
+                    module_scope = master_blueprint.get("provider_modules", {}).get(provider, {})
 
                     if isinstance(build_result, Exception):
                         logger.error("Build failed for %s: %s", provider, build_result)
@@ -382,23 +902,42 @@ class Orchestrator:
                             session_id=session_id,
                             provider=provider,
                             model=model,
-                            sandbox_id=sandbox_id,
                             status="failed",
                             build_log=str(build_result),
+                            module_scope_json=module_scope,
+                            candidate_format="assembly_contributor",
                         )
                     else:
-                        files = build_result.get("files", {})
-                        await sandbox_manager.upload_files(sandbox_id, files)
+                        duration_ms = build_result.get("duration_ms")
+                        if build_result.get("error"):
+                            logger.error("Build failed for %s: %s", provider, build_result["error"])
+                            candidate = BuildCandidate(
+                                session_id=session_id,
+                                provider=provider,
+                                model=model,
+                                status="failed",
+                                build_log=build_result["error"],
+                                build_duration_ms=duration_ms,
+                                module_scope_json=module_scope,
+                                candidate_format="assembly_contributor",
+                            )
+                        else:
+                            build_payload = build_result.get("result") or {}
+                            files, files_changed = repair_nextjs_project_files(build_payload.get("files", {}))
+                            if files_changed:
+                                logger.info("Applied deterministic Next.js file repair for provider %s", provider)
 
-                        candidate = BuildCandidate(
-                            session_id=session_id,
-                            provider=provider,
-                            model=model,
-                            sandbox_id=sandbox_id,
-                            status="built",
-                            files_json=files,
-                            build_log=build_result.get("summary", ""),
-                        )
+                            candidate = BuildCandidate(
+                                session_id=session_id,
+                                provider=provider,
+                                model=model,
+                                status="built",
+                                files_json=files,
+                                build_log=build_payload.get("summary", ""),
+                                build_duration_ms=duration_ms,
+                                module_scope_json=module_scope,
+                                candidate_format="assembly_contributor",
+                            )
 
                     db.add(candidate)
                     await db.flush()
@@ -409,17 +948,21 @@ class Orchestrator:
                             "candidate_id": str(candidate.id),
                             "provider": provider,
                             "status": candidate.status,
+                            "model": candidate.model,
+                            "build_log": candidate.build_log,
+                            "duration_ms": candidate.build_duration_ms,
                         },
                     ))
-
-                    # Pacing to ensure SSE delivery
                     await asyncio.sleep(0.1)
 
+                session = await self._get_session(db, session_id)
+                architecture_json = dict(session.architecture_json or {})
+                architecture_json["stage"] = "assembly_complete"
+                session.architecture_json = architecture_json
                 await db.commit()
-                logger.info("Built candidates committed and event published for session %s", session_id)
+                logger.info("Module contributors committed for session %s", session_id)
 
-            # Proceed to judging
-            logger.info("Transitioning to Judging Phase for session %s", session_id)
+            logger.info("Transitioning to synthesis for session %s", session_id)
             await self._judge_candidates(session_id)
 
         except Exception as e:
@@ -430,17 +973,11 @@ class Orchestrator:
             ))
 
     async def _judge_candidates(self, session_id: uuid.UUID) -> None:
-        """Have Claude judge the two candidates."""
+        """Score contributors, synthesize a baseline, and hand it off to hardening."""
         async with async_session_factory() as db:
             session = await self._get_session(db, session_id)
             session.status = "judging"
-
-            result = await db.execute(
-                select(BuildCandidate)
-                .where(BuildCandidate.session_id == session_id)
-                .where(BuildCandidate.status == "built")
-            )
-            candidates = list(result.scalars().all())
+            await db.commit()
 
             result = await db.execute(
                 select(RequirementSpec)
@@ -450,85 +987,202 @@ class Orchestrator:
             )
             spec = result.scalar_one_or_none()
 
-            if len(candidates) < 1:
+            result = await db.execute(
+                select(BuildCandidate)
+                .where(BuildCandidate.session_id == session_id)
+                .where(BuildCandidate.status == "built")
+                .where(BuildCandidate.provider != "synthesis")
+            )
+            candidates = list(result.scalars().all())
+
+            architecture_json = dict(session.architecture_json or {})
+            profile = get_profile(session.profile_type or "unsupported", blueprint=spec.blueprint_json if spec else None)
+
+        if len(candidates) < 1:
+            async with async_session_factory() as db:
+                session = await self._get_session(db, session_id)
                 session.status = "failed"
                 await db.commit()
-                await event_bus.publish(ErrorEvent(
-                    session_id=session_id,
-                    data={"error": "No successful candidates", "detail": "Both builders failed"},
-                ))
-                return
+            await event_bus.publish(ErrorEvent(
+                session_id=session_id,
+                data={"error": "No successful candidates", "detail": "All module contributors failed"},
+            ))
+            return
 
-            # If only one candidate OR no judge available, auto-select
-            if len(candidates) == 1 or not self.judge:
-                winner = candidates[0]
+        if architecture_json.get("protocol") != "assembly_v1":
+            async with async_session_factory() as db:
+                session = await self._get_session(db, session_id)
+                session.status = "hardening"
+                result = await db.execute(
+                    select(BuildCandidate).where(BuildCandidate.id == candidates[0].id)
+                )
+                winner = result.scalar_one()
                 winner.is_baseline = True
                 winner.score = 100.0
-                session.status = "hardening"
-                reason = "Only one candidate" if len(candidates) == 1 else "Claude judge not configured — auto-selecting"
-                await db.commit()
-                await event_bus.publish(JudgeResultEvent(
+                decision = JudgeDecision(
                     session_id=session_id,
-                    data={"winning_candidate_id": str(winner.id), "reasoning": reason, "winner": winner.provider},
-                ))
-                await self.start_hardening(session_id)
-                return
-
-            profile = get_profile(session.profile_type or "unsupported")
-
-            # Pick first two candidates as A/B — works regardless of which providers ran
-            cand_a = candidates[0]
-            cand_b = candidates[1]
-
-            judge_result = await self.judge.judge_candidates(
-                requirements_json=spec.requirements_json,
-                profile_type=profile.name,
-                openai_candidate={
-                    "files": cand_a.files_json,
-                    "model": cand_a.model,
-                    "test_results": cand_a.test_results_json,
-                    "provider": cand_a.provider,
+                    winning_candidate_id=winner.id,
+                    reasoning="Fallback competitive flow used.",
+                    scores_json={winner.provider: {"total_weighted": 100.0}},
+                    criteria_json=["fallback competitive flow"],
+                )
+                db.add(decision)
+                await db.commit()
+            await event_bus.publish(JudgeResultEvent(
+                session_id=session_id,
+                data={
+                    "winning_candidate_id": str(winner.id),
+                    "winner": winner.provider,
+                    "reasoning": "Fallback competitive flow used.",
+                    "scores": {winner.provider: {"total_weighted": 100.0}},
                 },
-                deepseek_candidate={
-                    "files": cand_b.files_json,
-                    "model": cand_b.model,
-                    "test_results": cand_b.test_results_json,
-                    "provider": cand_b.provider,
-                },
+            ))
+            await self.start_hardening(session_id)
+            return
+
+        candidate_payloads = [
+            {
+                "id": candidate.id,
+                "provider": candidate.provider,
+                "model": candidate.model,
+                "files_json": dict(candidate.files_json or {}),
+                "build_log": candidate.build_log,
+                "module_scope_json": dict(candidate.module_scope_json or {}),
+                "test_results_json": dict(candidate.test_results_json or {}),
+            }
+            for candidate in candidates
+        ]
+        master_blueprint = architecture_json.get("master_blueprint") or build_deterministic_plan(
+            profile_type=profile.name,
+            base_blueprint=spec.blueprint_json if spec else {},
+            planned_builders=[candidate["provider"] for candidate in candidate_payloads],
+        )
+
+        await event_bus.publish(SessionStatusEvent(
+            session_id=session_id,
+            data={"status": "judging", "detail": "Cross-model peer review running…"},
+        ))
+        peer_reviews = await self._run_peer_reviews(
+            master_blueprint=master_blueprint,
+            candidate_payloads=candidate_payloads,
+            builder_catalog=self._available_builders(),
+        )
+
+        await event_bus.publish(SessionStatusEvent(
+            session_id=session_id,
+            data={"status": "judging", "detail": "Final synthesis assembling baseline…"},
+        ))
+        scores, advisory_reasoning, criteria = await self._score_contributors(
+            session_id=session_id,
+            spec=spec,
+            profile_name=profile.name,
+            candidate_payloads=candidate_payloads,
+        )
+
+        merged = merge_synthesized_files(
+            master_blueprint=master_blueprint,
+            candidate_files={payload["provider"]: payload["files_json"] for payload in candidate_payloads},
+            preferred_order=[payload["provider"] for payload in candidate_payloads],
+        )
+        synthesis_files, files_changed = repair_nextjs_project_files(merged.get("files", {}))
+        if files_changed:
+            logger.info("Applied deterministic Next.js file repair for synthesized baseline")
+
+        synthesis_sandbox_id = await sandbox_manager.create_sandbox(profile.name, str(session_id))
+        await sandbox_manager.upload_files(synthesis_sandbox_id, synthesis_files)
+
+        async with async_session_factory() as db:
+            session = await self._get_session(db, session_id)
+            result = await db.execute(
+                select(BuildCandidate)
+                .where(BuildCandidate.session_id == session_id)
+                .where(BuildCandidate.provider != "synthesis")
             )
+            persisted_candidates = list(result.scalars().all())
+            candidate_by_provider = {candidate.provider: candidate for candidate in persisted_candidates}
 
-            # Select winner — judge returns "openai"/"deepseek" labels but we map
-            # by actual provider field to handle any DB ordering or 4-provider scenario.
-            winner = judge_result.get("winner", "tie")
-            provider_map = {c.provider: c for c in candidates}
-            winning_candidate = provider_map.get(winner) or cand_a  # fallback to first
-            winning_candidate.is_baseline = True
-            winning_id = winning_candidate.id
+            for candidate in persisted_candidates:
+                raw_score = None
+                if isinstance(scores.get(candidate.provider), dict):
+                    raw_score = scores[candidate.provider].get("total_weighted")
+                try:
+                    candidate.score = float(raw_score) if raw_score is not None else candidate.score
+                except (TypeError, ValueError):
+                    candidate.score = candidate.score
+                candidate.review_notes_json = [
+                    review for review in peer_reviews
+                    if review.get("target") == candidate.provider
+                ]
+                candidate.is_baseline = False
 
-            # Save judge decision
+            synthesis_candidate = BuildCandidate(
+                session_id=session_id,
+                provider="synthesis",
+                model=self.judge.model if self.judge else "assembly_v1",
+                sandbox_id=synthesis_sandbox_id,
+                status="built",
+                score=100.0,
+                is_baseline=True,
+                files_json=synthesis_files,
+                build_log=merged.get("summary", "Synthesized baseline assembled from contributor modules."),
+                module_scope_json={
+                    "module_name": "Synthesized baseline",
+                    "contributors": merged.get("contributions", {}),
+                    "owned_files": master_blueprint.get("file_tree", []),
+                    "source_providers": list(candidate_by_provider.keys()),
+                },
+                review_notes_json=peer_reviews,
+                candidate_format="synthesized_baseline",
+            )
+            db.add(synthesis_candidate)
+            await db.flush()
+
+            architecture_json["stage"] = "synthesized"
+            architecture_json["peer_reviews"] = peer_reviews
+            architecture_json["synthesis"] = {
+                "summary": merged.get("summary", ""),
+                "contributions": merged.get("contributions", {}),
+                "source_providers": list(candidate_by_provider.keys()),
+            }
+            session.architecture_json = architecture_json
+
+            reasoning = "Assembly protocol merged module contributions into a single baseline for hardening."
+            if advisory_reasoning:
+                reasoning = f"{reasoning} {advisory_reasoning.strip()}"
             decision = JudgeDecision(
                 session_id=session_id,
-                winning_candidate_id=winning_id,
-                reasoning=judge_result.get("reasoning", ""),
-                scores_json=judge_result.get("scores", {}),
-                criteria_json=judge_result.get("criteria", []),
+                winning_candidate_id=synthesis_candidate.id,
+                reasoning=reasoning,
+                scores_json=scores,
+                criteria_json=list(criteria) + ["assembly_v1 synthesized baseline"],
             )
             db.add(decision)
 
             session.status = "hardening"
             await db.commit()
 
-            await event_bus.publish(JudgeResultEvent(
-                session_id=session_id,
-                data={
-                    "winning_candidate_id": str(winning_id),
-                    "winner": winner,
-                    "reasoning": judge_result.get("reasoning", ""),
-                    "scores": judge_result.get("scores", {}),
-                },
-            ))
+        await event_bus.publish(CandidateReadyEvent(
+            session_id=session_id,
+            data={
+                "candidate_id": str(synthesis_candidate.id),
+                "provider": "synthesis",
+                "status": "built",
+                "model": synthesis_candidate.model,
+                "build_log": synthesis_candidate.build_log,
+                "duration_ms": None,
+            },
+        ))
+        await event_bus.publish(JudgeResultEvent(
+            session_id=session_id,
+            data={
+                "winning_candidate_id": str(synthesis_candidate.id),
+                "winner": "synthesis",
+                "reasoning": reasoning,
+                "scores": scores,
+            },
+        ))
 
-            await self.start_hardening(session_id)
+        await self.start_hardening(session_id)
 
     # ── Hardening Phase ────────────────────────────────────
 

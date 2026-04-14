@@ -7,6 +7,8 @@ from __future__ import annotations
 import uuid
 import asyncio
 import logging
+import re
+from datetime import datetime, timezone
 from typing import Dict
 
 from sqlalchemy import select
@@ -37,6 +39,12 @@ from mark_ii.schemas import PhaseResult, SwarmReport
 
 logger = logging.getLogger(__name__)
 
+_REPAIR_STOPWORDS = {
+    "the", "and", "with", "from", "that", "this", "into", "while", "under",
+    "during", "caused", "server", "failed", "failure", "critical", "attack",
+    "detected", "error", "status", "details", "unknown", "mark", "phase",
+}
+
 
 class HardeningService:
     """
@@ -46,7 +54,9 @@ class HardeningService:
 
     def __init__(self) -> None:
         self.builder = OpenAIBuilder()
-        self.agent = AdversaryAgent()
+        self.agent = AdversaryAgent(
+            model=settings.openai_adversary_model or settings.openai_builder_model
+        )
         self._locks: Dict[uuid.UUID, asyncio.Lock] = {}
 
     def _get_lock(self, session_id: uuid.UUID) -> asyncio.Lock:
@@ -131,7 +141,15 @@ class HardeningService:
                         candidate_id=current_candidate_id,
                     )
                     if base_url is None:
-                        # Unrecoverable — stop the loop
+                        # Unrecoverable — mark complete so UI stops polling
+                        async with async_session_factory() as db:
+                            session_obj = await self._get_session(db, session_id)
+                            session_obj.status = "complete"
+                            await db.commit()
+                        await event_bus.publish(SessionStatusEvent(
+                            session_id=session_id,
+                            data={"status": "complete", "detail": "Service failed to start — hardening stopped"},
+                        ))
                         break
 
                     # Update sandbox_id in case self-healing created a new one
@@ -168,15 +186,26 @@ class HardeningService:
                         )
                         for i, res in enumerate(attack_results)
                     ]
-                    passed = all(p.passed for p in phases)
+                    result_type, primary_phase = _derive_report_result_type(phases)
+                    passed = result_type == "passed"
+                    critical_failures = sum(1 for p in phases if _phase_result_type(p) == "breach")
+                    inconclusive_failures = sum(1 for p in phases if _phase_result_type(p) == "inconclusive")
                     report = SwarmReport(
                         base_url=base_url,
                         passed=passed,
                         phases=phases,
                         summary={
-                            "critical_failures": sum(1 for p in phases if not p.passed),
-                            "passed_phases": sum(1 for p in phases if p.passed),
-                            "verdict": "Armor Holds" if passed else "Breach Detected",
+                            "critical_failures": critical_failures,
+                            "inconclusive_failures": inconclusive_failures,
+                            "passed_phases": sum(1 for p in phases if _phase_result_type(p) == "passed"),
+                            "verdict": (
+                                "Armor Holds"
+                                if result_type == "passed"
+                                else "Breach Detected"
+                                if result_type == "breach"
+                                else "Attack Inconclusive"
+                            ),
+                            "result_type": result_type,
                         },
                     )
 
@@ -198,59 +227,95 @@ class HardeningService:
                             passed=report.passed,
                             swarm_report_json=map_swarm_report_to_db(report),
                         )
+                        repair_failed = False
 
                         if not report.passed:
-                            critical_phase = next((p for p in report.phases if p.critical), report.phases[0])
-                            mark_run.failure_type = critical_phase.name
-                            mark_run.rejection_reason = "\n".join(critical_phase.details)
-                            logger.warning("Mark %s FAILED: %s", mark_name, mark_run.failure_type)
-
-                            await event_bus.publish(SessionStatusEvent(
-                                session_id=session_id,
-                                data={"status": "hardening", "detail": "Vulnerability detected — repair engineer patching…"},
-                            ))
-
-                            repair_result = await self.builder.repair(
-                                failure_type=mark_run.failure_type,
-                                source_files=current_files,
-                                failure_details=mark_run.rejection_reason,
-                                requirements_json=requirements_json,
+                            issue_phase = primary_phase or report.phases[0]
+                            mark_run.failure_type = _classify_mark_failure(
+                                issue_phase.name,
+                                issue_phase.details,
                             )
+                            mark_run.rejection_reason = "\n".join(issue_phase.details)
 
-                            repaired_files = repair_result.get("files") or {}
-                            if repaired_files:
-                                mark_run.patch_summary = repair_result.get("summary", "Patch applied")
-                                mark_run.repair_provider = "openai"
-                                mark_run.repair_model = settings.openai_builder_model
+                            if result_type == "breach":
+                                logger.warning("Mark %s FAILED: %s", mark_name, mark_run.failure_type)
 
-                                new_candidate = BuildCandidate(
+                                await event_bus.publish(SessionStatusEvent(
                                     session_id=session_id,
-                                    provider="openai",
-                                    model=settings.openai_builder_model,
-                                    sandbox_id=current_sandbox_id,
-                                    status="built",
-                                    files_json=repaired_files,
-                                    build_log=f"Repair: {mark_run.patch_summary}",
+                                    data={"status": "hardening", "detail": "Vulnerability detected — repair engineer patching…"},
+                                ))
+
+                                target_file, context_files = _select_repair_context(
+                                    current_files,
+                                    profile_type=profile_type,
+                                    failure_type=mark_run.failure_type or "",
+                                    failure_details=mark_run.rejection_reason or "",
                                 )
-                                db.add(new_candidate)
-                                await db.flush()
+                                repair_requirements = _compact_repair_requirements(requirements_json)
+                                logger.info(
+                                    "Repair focus for Mark %s: target=%s context_files=%s",
+                                    mark_name,
+                                    target_file,
+                                    list(context_files.keys()),
+                                )
 
-                                await sandbox_manager.upload_files(current_sandbox_id, repaired_files)
+                                repair_result = await self.builder.repair(
+                                    failure_type=mark_run.failure_type,
+                                    source_files=current_files,
+                                    failure_details=mark_run.rejection_reason,
+                                    requirements_json=repair_requirements,
+                                    target_file=target_file,
+                                    context_files=context_files,
+                                )
 
-                                if db_candidate:
-                                    await harvester_service.harvest_repair(
-                                        db=db,
-                                        mark_run=mark_run,
-                                        broken_candidate=db_candidate,
-                                        fixed_candidate=new_candidate,
+                                repaired_files = repair_result.get("files") or {}
+                                repair_error = (repair_result.get("error") or "").strip()
+                                repair_changed = bool(repaired_files) and repaired_files != current_files
+                                if repair_changed:
+                                    mark_run.patch_summary = repair_result.get("summary", "Patch applied")
+                                    mark_run.repair_provider = "openai"
+                                    mark_run.repair_model = settings.openai_builder_model
+
+                                    new_candidate = BuildCandidate(
+                                        session_id=session_id,
+                                        provider="openai",
+                                        model=settings.openai_builder_model,
+                                        sandbox_id=current_sandbox_id,
+                                        status="built",
+                                        files_json=repaired_files,
+                                        build_log=f"Repair: {mark_run.patch_summary}",
                                     )
+                                    db.add(new_candidate)
+                                    await db.flush()
 
-                                # Update plain-value state for next iteration
-                                current_candidate_id = new_candidate.id
-                                current_files = dict(repaired_files)
-                                logger.info("Mark %s: repair applied", mark_name)
+                                    await sandbox_manager.upload_files(current_sandbox_id, repaired_files)
+
+                                    if db_candidate:
+                                        await harvester_service.harvest_repair(
+                                            db=db,
+                                            mark_run=mark_run,
+                                            broken_candidate=db_candidate,
+                                            fixed_candidate=new_candidate,
+                                        )
+
+                                    # Update plain-value state for next iteration
+                                    current_candidate_id = new_candidate.id
+                                    current_files = dict(repaired_files)
+                                    logger.info("Mark %s: repair applied", mark_name)
+                                else:
+                                    repair_failed = True
+                                    patch_summary = repair_result.get("summary") or "Repair failed"
+                                    if repair_error and repair_error not in patch_summary:
+                                        patch_summary = f"{patch_summary}: {repair_error}"
+                                    mark_run.patch_summary = patch_summary
+                                    logger.error("Mark %s: repair failed (%s)", mark_name, patch_summary)
                             else:
-                                logger.error("Mark %s: repair returned no files", mark_name)
+                                mark_run.patch_summary = "No repair applied because the attack outcome was inconclusive."
+                                logger.warning("Mark %s inconclusive: %s", mark_name, mark_run.failure_type)
+                                await event_bus.publish(SessionStatusEvent(
+                                    session_id=session_id,
+                                    data={"status": "hardening", "detail": "Attack outcome inconclusive — continuing without repair…"},
+                                ))
                         else:
                             logger.info("Mark %s: ARMOR HOLDS", mark_name)
 
@@ -262,7 +327,9 @@ class HardeningService:
                                 "mark_number": mark_number,
                                 "mark_name": mark_name,
                                 "passed": report.passed,
+                                "result_type": result_type,
                                 "failure_type": mark_run.failure_type,
+                                "rejection_reason": mark_run.rejection_reason,
                                 "patch_summary": mark_run.patch_summary,
                             },
                         ))
@@ -282,6 +349,26 @@ class HardeningService:
                             ))
                             return  # Done
 
+                        if repair_failed:
+                            session_obj = await self._get_session(db, session_id)
+                            session_obj.status = "complete"
+                            await db.commit()
+
+                            await event_bus.publish(ErrorEvent(
+                                session_id=session_id,
+                                data={
+                                    "error": mark_run.patch_summary,
+                                    "detail": f"Repair engineer could not patch Mark {mark_name}",
+                                },
+                            ))
+                            await event_bus.publish(SessionStatusEvent(
+                                session_id=session_id,
+                                data={"status": "complete", "detail": "Repair failed — manual review recommended"},
+                            ))
+                            return
+
+                        session_obj = await self._get_session(db, session_id)
+                        session_obj.updated_at = datetime.now(timezone.utc)
                         await db.commit()
 
                 # Loop exhausted — all marks failed
@@ -296,11 +383,7 @@ class HardeningService:
 
             except Exception as e:
                 logger.error("Hardening loop crashed: %s", e, exc_info=True)
-                await event_bus.publish(ErrorEvent(
-                    session_id=session_id,
-                    data={"error": str(e), "detail": "Hardening loop crashed"},
-                ))
-                # Mark session failed so UI doesn't stay stuck on "hardening"
+                # Persist status first so polling clients see "complete" even if SSE is lost
                 try:
                     async with async_session_factory() as db:
                         session_obj = await self._get_session(db, session_id)
@@ -308,6 +391,15 @@ class HardeningService:
                         await db.commit()
                 except Exception:
                     pass
+                # Publish after DB write so SSE subscribers (if still connected) also get it
+                await event_bus.publish(ErrorEvent(
+                    session_id=session_id,
+                    data={"error": str(e), "detail": "Hardening loop crashed"},
+                ))
+                await event_bus.publish(SessionStatusEvent(
+                    session_id=session_id,
+                    data={"status": "complete", "detail": "Hardening failed — session marked complete"},
+                ))
 
     async def _ensure_service(
         self,
@@ -408,6 +500,184 @@ def _infer_startup_command(files: dict) -> str:
             module = name[:-3]
             return f"uvicorn {module}:app --host 0.0.0.0 --port 8000"
     return "python main.py"
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}... [truncated]"
+
+
+def _compact_repair_requirements(requirements_json: dict) -> dict:
+    def _compact_list(items: list, max_items: int, max_chars: int) -> list:
+        compacted: list = []
+        for item in items[:max_items]:
+            if isinstance(item, dict):
+                compacted.append({
+                    key: _truncate_text(str(value), max_chars)
+                    for key, value in list(item.items())[:6]
+                })
+            else:
+                compacted.append(_truncate_text(str(item), max_chars))
+        omitted = len(items) - len(compacted)
+        if omitted > 0:
+            compacted.append(f"... {omitted} additional items omitted")
+        return compacted
+
+    return {
+        "functional": _compact_list(requirements_json.get("functional", []), max_items=8, max_chars=180),
+        "routes_or_pages": _compact_list(requirements_json.get("routes_or_pages", []), max_items=8, max_chars=140),
+        "data_model": _compact_list(requirements_json.get("data_model", []), max_items=6, max_chars=160),
+        "security": _compact_list(requirements_json.get("security", []), max_items=6, max_chars=160),
+        "behavior": _compact_list(requirements_json.get("behavior", []), max_items=6, max_chars=160),
+        "technical": _compact_list(requirements_json.get("technical", []), max_items=6, max_chars=160),
+    }
+
+
+def _extract_failure_keywords(failure_type: str, failure_details: str) -> set[str]:
+    tokens = {
+        token
+        for token in re.findall(r"[a-zA-Z_]{3,}", f"{failure_type} {failure_details}".lower())
+        if token not in _REPAIR_STOPWORDS
+    }
+    expanded = set(tokens)
+    if any(token in tokens for token in {"json", "payload", "boundary", "path", "probe", "endpoint"}):
+        expanded.update({"api", "route", "validation", "request"})
+    if any(token in tokens for token in {"race", "flood", "concurrent"}):
+        expanded.update({"lock", "balance", "transfer", "reset"})
+    return expanded
+
+
+def _classify_mark_failure(phase_name: str, details: list[str]) -> str:
+    joined = " ".join(details).lower()
+    if any(
+        marker in joined
+        for marker in (
+            "judge unavailable",
+            "judge error",
+            "request failed",
+            "request/judge failed",
+            "probe synthesis failed",
+        )
+    ):
+        return "AttackExecutionFailure"
+    return phase_name
+
+
+def _phase_result_type(phase: PhaseResult) -> str:
+    outcome = str((phase.metrics or {}).get("outcome") or "").lower()
+    if outcome == "breach":
+        return "breach"
+    if outcome in {"execution_failed", "judge_unavailable", "probe_synthesis_failed", "inconclusive"}:
+        return "inconclusive"
+    if phase.critical and not phase.passed:
+        return "breach"
+    if not phase.passed:
+        return "inconclusive"
+    return "passed"
+
+
+def _derive_report_result_type(phases: list[PhaseResult]) -> tuple[str, PhaseResult | None]:
+    for phase in phases:
+        if _phase_result_type(phase) == "breach":
+            return "breach", phase
+    for phase in phases:
+        if _phase_result_type(phase) == "inconclusive":
+            return "inconclusive", phase
+    return "passed", None
+
+
+def _source_file_priority(path: str, profile_type: str) -> int:
+    path_lower = path.lower()
+    if profile_type == "fastapi_service":
+        if path_lower == "main.py":
+            return 120
+        if path_lower in {"app.py", "server.py"}:
+            return 110
+        if path_lower.endswith(".py"):
+            return 70
+    if profile_type == "nextjs_webapp":
+        if "/api/" in path_lower and path_lower.endswith(("route.ts", "route.js")):
+            return 120
+        if path_lower in {"app/page.tsx", "src/app/page.tsx"}:
+            return 110
+        if path_lower in {"app/layout.tsx", "src/app/layout.tsx"}:
+            return 100
+        if path_lower.endswith((".tsx", ".ts", ".jsx", ".js")):
+            return 70
+    if path_lower.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+        return 50
+    return 0
+
+
+def _score_repair_file(
+    path: str,
+    content: str,
+    profile_type: str,
+    failure_keywords: set[str],
+) -> int:
+    path_lower = path.lower()
+    content_lower = content.lower()
+    score = _source_file_priority(path, profile_type)
+
+    if any(marker in path_lower for marker in ("test", ".spec.", ".test.")):
+        score -= 40
+    if path_lower.endswith(("requirements.txt", "package.json", "tsconfig.json", "next.config.js", "next.config.mjs")):
+        score -= 20
+
+    for keyword in failure_keywords:
+        if keyword in path_lower:
+            score += 25
+        if keyword in content_lower:
+            score += 4
+
+    if any(token in failure_keywords for token in {"api", "route", "request", "validation"}):
+        if "/api/" in path_lower or path_lower.endswith(".py") or "route." in path_lower:
+            score += 20
+    if any(token in failure_keywords for token in {"lock", "race", "concurrent"}):
+        if any(token in content_lower for token in ("lock", "asyncio", "mutex")):
+            score += 20
+
+    return score
+
+
+def _select_repair_context(
+    current_files: dict[str, str],
+    *,
+    profile_type: str,
+    failure_type: str,
+    failure_details: str,
+) -> tuple[str, dict[str, str]]:
+    if not current_files:
+        return "main.py", {}
+
+    failure_keywords = _extract_failure_keywords(failure_type, failure_details)
+    ranked = sorted(
+        current_files.items(),
+        key=lambda item: (
+            _score_repair_file(item[0], item[1], profile_type, failure_keywords),
+            item[0],
+        ),
+        reverse=True,
+    )
+
+    target_file = ranked[0][0]
+    context_files: dict[str, str] = {target_file: current_files[target_file]}
+
+    for path, content in ranked[1:]:
+        if len(context_files) >= 4:
+            break
+        if _source_file_priority(path, profile_type) <= 0:
+            continue
+        context_files[path] = content
+
+    for config_name in ("requirements.txt", "package.json", "tsconfig.json"):
+        if len(context_files) >= 6:
+            break
+        if config_name in current_files and config_name not in context_files:
+            context_files[config_name] = current_files[config_name]
+
+    return target_file, context_files
 
 
 # Singleton

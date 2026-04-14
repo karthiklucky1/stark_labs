@@ -40,6 +40,8 @@ class Settings(BaseSettings):
 
     # ── Model Selection ────────────────────────────────────
     openai_builder_model: str = "gpt-5.4-2026-03-05"
+    openai_interviewer_model: str = ""
+    openai_adversary_model: str = ""
     deepseek_builder_model: str = "deepseek-reasoner"
     zhipu_builder_model: str = "glm-4-air"
     claude_judge_model: str = "claude-sonnet-4-20250514"

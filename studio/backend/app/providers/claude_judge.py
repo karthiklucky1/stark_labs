@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 JUDGE_SYSTEM_PROMPT = """You are Mark II Studio's Judge — an impartial, expert code reviewer.
 
 Your role:
-1. Compare two build candidates produced by different AI builders
+1. Compare all provided build candidates produced by different AI builders
 2. Score each candidate against the confirmed requirements
 3. Select the best candidate as the baseline for hardening
 4. NEVER write code yourself — you ONLY evaluate
@@ -31,19 +31,10 @@ Evaluation criteria (weighted):
 
 Output EXACTLY this JSON (no other text):
 {
-  "winner": "openai" | "deepseek" | "tie",
+  "winner": "provider_id" | "tie",
   "reasoning": "Detailed explanation of why the winner was chosen",
   "scores": {
-    "openai": {
-      "requirements_compliance": 0-10,
-      "code_quality": 0-10,
-      "error_handling": 0-10,
-      "security": 0-10,
-      "test_readiness": 0-10,
-      "performance": 0-10,
-      "total_weighted": 0-100
-    },
-    "deepseek": {
+    "provider_id": {
       "requirements_compliance": 0-10,
       "code_quality": 0-10,
       "error_handling": 0-10,
@@ -62,27 +53,20 @@ Output EXACTLY this JSON (no other text):
 }
 """
 
-JUDGE_PROMPT = """Compare these two build candidates for the following requirements.
+JUDGE_PROMPT = """Compare these build candidates for the following requirements.
 
 ## Requirements Spec
 {requirements_json}
 
 ## Project Profile: {profile_type}
 
-## Candidate A — OpenAI ({openai_model})
-{openai_files}
+## Allowed winner values
+{winner_values}
 
-## Candidate B — DeepSeek ({deepseek_model})
-{deepseek_files}
+## Candidates
+{candidate_sections}
 
-## Test Results
-### OpenAI
-{openai_test_results}
-
-### DeepSeek
-{deepseek_test_results}
-
-Evaluate both candidates and select the winner.
+Evaluate all candidates and select the winner.
 """
 
 CHANGE_CLASSIFY_SYSTEM = """You are Mark II Studio's Change Analyst.
@@ -114,22 +98,17 @@ class ClaudeJudge:
         self,
         requirements_json: dict,
         profile_type: str,
-        openai_candidate: dict,  # {files, model, test_results}
-        deepseek_candidate: dict,
+        candidates: list[dict],
     ) -> dict:
-        """Compare two candidates and select the winner."""
-        openai_files = self._format_files(openai_candidate.get("files", {}))
-        deepseek_files = self._format_files(deepseek_candidate.get("files", {}))
+        """Compare all built candidates and select the winner."""
+        candidate_ids = [candidate.get("provider", "unknown") for candidate in candidates]
+        candidate_sections = self._format_candidates(candidates)
 
         prompt = JUDGE_PROMPT.format(
             requirements_json=json.dumps(requirements_json, indent=2),
             profile_type=profile_type,
-            openai_model=openai_candidate.get("model", "unknown"),
-            openai_files=openai_files,
-            deepseek_model=deepseek_candidate.get("model", "unknown"),
-            deepseek_files=deepseek_files,
-            openai_test_results=json.dumps(openai_candidate.get("test_results", {}), indent=2),
-            deepseek_test_results=json.dumps(deepseek_candidate.get("test_results", {}), indent=2),
+            winner_values=", ".join(candidate_ids + ["tie"]),
+            candidate_sections=candidate_sections,
         )
 
         response = await self.client.messages.create(
@@ -142,7 +121,13 @@ class ClaudeJudge:
 
         content = self._extract_text(response)
         try:
-            return json.loads(content)
+            result = json.loads(content)
+            winner = result.get("winner")
+            if winner not in candidate_ids and winner != "tie":
+                result["winner"] = "tie"
+            if not isinstance(result.get("scores"), dict):
+                result["scores"] = {}
+            return result
         except json.JSONDecodeError:
             logger.error("Judge returned non-JSON: %s", content[:200])
             return {
@@ -189,12 +174,46 @@ Current requirements:
                 "requires_approval": False,
             }
 
+    def _format_candidates(self, candidates: list[dict]) -> str:
+        sections = []
+        for candidate in candidates:
+            provider = candidate.get("provider", "unknown")
+            model = candidate.get("model", "unknown")
+            test_results = json.dumps(candidate.get("test_results", {}), indent=2)
+            files = self._format_files(candidate.get("files", {}))
+            sections.append(
+                f"### Candidate: {provider}\n"
+                f"Model: {model}\n\n"
+                f"Files:\n{files}\n\n"
+                f"Test Results:\n```json\n{test_results}\n```"
+            )
+        return "\n\n".join(sections)
+
     def _format_files(self, files: dict[str, str]) -> str:
         if not files:
             return "(no files)"
+        priority_names = {
+            "main.py": 0,
+            "requirements.txt": 0,
+            "package.json": 0,
+            "app/page.tsx": 0,
+            "app/layout.tsx": 0,
+        }
+        max_files = 8
+        max_chars = 1200
         sections = []
-        for name, content in files.items():
-            sections.append(f"### {name}\n```\n{content}\n```")
+        sorted_items = sorted(
+            files.items(),
+            key=lambda item: (priority_names.get(item[0], 1), item[0]),
+        )
+        for name, content in sorted_items[:max_files]:
+            snippet = content[:max_chars]
+            if len(content) > max_chars:
+                snippet += "\n... [truncated]"
+            sections.append(f"### {name}\n```\n{snippet}\n```")
+        omitted = len(sorted_items) - max_files
+        if omitted > 0:
+            sections.append(f"... {omitted} additional files omitted")
         return "\n\n".join(sections)
 
     def _extract_text(self, response) -> str:
