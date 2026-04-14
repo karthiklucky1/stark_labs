@@ -4,6 +4,7 @@ Blueprint council, module ownership, peer review planning, and final synthesis.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -11,6 +12,98 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_PROVIDER_JSON_TIMEOUT_SECONDS = 45
+_SYNTHESIS_TIMEOUT_SECONDS = 45
+
+_PROPOSAL_OUTPUT_SCHEMA_JSON = json.dumps(
+    {
+        "summary": "Short provider-specific architecture summary",
+        "critical_files": ["path"],
+        "file_tree_delta": ["path"],
+        "api_contracts": [
+            {
+                "path": "/resource",
+                "methods": ["GET"],
+                "purpose": "What this route or page handles",
+            }
+        ],
+        "data_entities": [
+            {
+                "name": "EntityName",
+                "shape": "Short summary of important fields",
+            }
+        ],
+        "ui_surfaces": [
+            {
+                "surface": "Dashboard",
+                "purpose": "Primary user interaction",
+                "owner_hint": "provider_id",
+            }
+        ],
+        "module_boundaries": [
+            {
+                "module_name": "string",
+                "goal": "string",
+                "suggested_owner": "provider_id",
+                "files": ["path"],
+                "interfaces": ["string"],
+            }
+        ],
+        "integration_risks": ["string"],
+        "peer_review_focus": ["string"],
+    },
+    indent=2,
+)
+
+_REVIEW_OUTPUT_SCHEMA_JSON = json.dumps(
+    {
+        "verdict": "approve | concerns",
+        "summary": "Short review summary",
+        "critical_issues": ["string"],
+        "interface_gaps": ["string"],
+        "suggested_followups": ["string"],
+    },
+    indent=2,
+)
+
+_SYNTHESIS_OUTPUT_SCHEMA_JSON = json.dumps(
+    {
+        "summary": "Architecture summary",
+        "council_summary": ["string"],
+        "shared_contracts": ["string"],
+        "integration_notes": ["string"],
+        "api_contracts": [
+            {
+                "path": "/resource",
+                "methods": ["GET"],
+                "purpose": "What this route or page handles",
+            }
+        ],
+        "data_entities": [
+            {
+                "name": "EntityName",
+                "shape": "Short summary of important fields",
+            }
+        ],
+        "ui_surfaces": [
+            {
+                "surface": "Dashboard",
+                "purpose": "Primary user interaction",
+                "owner_hint": "provider_id",
+            }
+        ],
+        "provider_modules": {
+            "provider_id": {
+                "module_name": "string",
+                "responsibilities": ["string"],
+                "owned_files": ["path"],
+                "review_focus": ["string"],
+            }
+        },
+    },
+    indent=2,
+)
 
 _PROPOSAL_SYSTEM_PROMPT = """You are part of Stark Labs' Council of Architects.
 Return ONLY valid JSON.
@@ -34,21 +127,7 @@ _PROPOSAL_PROMPT = """Propose an implementation blueprint for this project.
 {provider_focus_json}
 
 ## Output JSON
-{{
-  "summary": "Short provider-specific architecture summary",
-  "critical_files": ["path"],
-  "module_boundaries": [
-    {{
-      "module_name": "string",
-      "goal": "string",
-      "suggested_owner": "provider_id",
-      "files": ["path"],
-      "interfaces": ["string"]
-    }}
-  ],
-  "integration_risks": ["string"],
-  "peer_review_focus": ["string"]
-}}
+{output_schema_json}
 """
 
 _REVIEW_SYSTEM_PROMPT = """You are a peer-review engineer in Stark Labs' modular assembly protocol.
@@ -79,13 +158,7 @@ _REVIEW_PROMPT = """Review this module contribution against the master blueprint
 {target_files}
 
 ## Output JSON
-{{
-  "verdict": "approve" | "concerns",
-  "summary": "Short review summary",
-  "critical_issues": ["string"],
-  "interface_gaps": ["string"],
-  "suggested_followups": ["string"]
-}}
+{output_schema_json}
 """
 
 _SYNTHESIS_SYSTEM_PROMPT = """You are Stark Labs' synthesis lead.
@@ -113,19 +186,7 @@ _SYNTHESIS_PROMPT = """Synthesize a single master blueprint from these architect
 {council_proposals_json}
 
 ## Output JSON
-{{
-  "summary": "Architecture summary",
-  "shared_contracts": ["string"],
-  "integration_notes": ["string"],
-  "provider_modules": {{
-    "provider_id": {{
-      "module_name": "string",
-      "responsibilities": ["string"],
-      "owned_files": ["path"],
-      "review_focus": ["string"]
-    }}
-  }}
-}}
+{output_schema_json}
 """
 
 
@@ -222,6 +283,104 @@ def _default_file_tree(profile_type: str) -> list[str]:
             "tests/test_api.py",
         ]
     return ["README.md"]
+
+
+def _normalize_methods(raw_methods: Any) -> list[str]:
+    if not isinstance(raw_methods, list):
+        return []
+    methods: list[str] = []
+    for item in raw_methods:
+        value = str(item or "").strip().upper()
+        if value:
+            methods.append(value)
+    return methods[:6]
+
+
+def _normalize_api_contracts(raw_contracts: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_contracts, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in raw_contracts[:10]:
+        if isinstance(item, dict):
+            path = str(item.get("path") or item.get("route") or item.get("name") or "").strip()
+            purpose = _truncate_text(str(item.get("purpose") or item.get("description") or ""), max_chars=140)
+            methods = _normalize_methods(item.get("methods"))
+            if path:
+                normalized.append({
+                    "path": path,
+                    "methods": methods,
+                    "purpose": purpose,
+                })
+        elif isinstance(item, str) and item.strip():
+            normalized.append({"path": item.strip(), "methods": [], "purpose": ""})
+    return normalized
+
+
+def _normalize_data_entities(raw_entities: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_entities, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in raw_entities[:10]:
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("entity") or item.get("table") or "").strip()
+            shape = _truncate_text(str(item.get("shape") or item.get("fields") or item.get("description") or ""), max_chars=160)
+            if name:
+                normalized.append({"name": name, "shape": shape})
+        elif isinstance(item, str) and item.strip():
+            normalized.append({"name": item.strip(), "shape": ""})
+    return normalized
+
+
+def _normalize_ui_surfaces(raw_surfaces: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_surfaces, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in raw_surfaces[:10]:
+        if isinstance(item, dict):
+            surface = str(item.get("surface") or item.get("name") or item.get("page") or "").strip()
+            purpose = _truncate_text(str(item.get("purpose") or item.get("description") or ""), max_chars=140)
+            owner_hint = str(item.get("owner_hint") or item.get("owner") or "").strip()
+            if surface:
+                normalized.append({"surface": surface, "purpose": purpose, "owner_hint": owner_hint})
+        elif isinstance(item, str) and item.strip():
+            normalized.append({"surface": item.strip(), "purpose": "", "owner_hint": ""})
+    return normalized
+
+
+def _derive_api_contracts(requirements_json: dict[str, Any], profile_type: str) -> list[dict[str, Any]]:
+    routes = requirements_json.get("routes_or_pages", [])
+    normalized = _normalize_api_contracts(routes)
+    if normalized:
+        return normalized
+    if profile_type == "fastapi_service":
+        return [{"path": "/health", "methods": ["GET"], "purpose": "Health check endpoint"}]
+    return [{"path": "/", "methods": ["GET"], "purpose": "Primary application route"}]
+
+
+def _derive_data_entities(requirements_json: dict[str, Any]) -> list[dict[str, str]]:
+    entities = _normalize_data_entities(requirements_json.get("data_model", []))
+    return entities
+
+
+def _derive_ui_surfaces(
+    requirements_json: dict[str, Any],
+    file_tree: list[str],
+    profile_type: str,
+) -> list[dict[str, str]]:
+    derived = _normalize_ui_surfaces(requirements_json.get("routes_or_pages", []))
+    if derived:
+        return derived
+
+    surfaces: list[dict[str, str]] = []
+    if profile_type == "nextjs_webapp":
+        for path in file_tree:
+            if path.endswith(("page.tsx", "page.jsx")):
+                surfaces.append({
+                    "surface": path.replace("app/", "").replace("/page.tsx", "").replace("/page.jsx", "") or "home",
+                    "purpose": "App route surface",
+                    "owner_hint": "",
+                })
+    return surfaces[:10]
 
 
 def _provider_responsibilities(provider: str, profile_type: str) -> list[str]:
@@ -330,9 +489,11 @@ def build_deterministic_plan(
     *,
     profile_type: str,
     base_blueprint: dict[str, Any],
+    requirements_json: dict[str, Any] | None,
     planned_builders: list[str],
 ) -> dict[str, Any]:
     file_tree = _normalize_file_tree(base_blueprint.get("file_tree")) or _default_file_tree(profile_type)
+    requirements_json = requirements_json or {}
     provider_modules: dict[str, dict[str, Any]] = {}
 
     for provider in planned_builders:
@@ -360,6 +521,7 @@ def build_deterministic_plan(
 
     return {
         "summary": "Deterministic multi-model module plan.",
+        "council_summary": ["Deterministic blueprint generated from confirmed requirements and file ownership heuristics."],
         "shared_contracts": [
             "Preserve agreed file ownership; avoid overwriting another model's owned files.",
             "Keep top-level dependencies and runtime commands consistent with the master blueprint.",
@@ -369,6 +531,9 @@ def build_deterministic_plan(
             "Module owners may emit support files outside their scope, but synthesis prefers the declared owner version for owned files.",
             "If an owned file is missing, synthesis falls back to the best available contributor version.",
         ],
+        "api_contracts": _derive_api_contracts(requirements_json, profile_type),
+        "data_entities": _derive_data_entities(requirements_json),
+        "ui_surfaces": _derive_ui_surfaces(requirements_json, file_tree, profile_type),
         "provider_modules": provider_modules,
         "peer_review_pairs": _build_peer_review_pairs(planned_builders),
         "file_tree": file_tree,
@@ -384,13 +549,14 @@ async def request_provider_proposal(
     base_blueprint: dict[str, Any],
     deterministic_module: dict[str, Any],
 ) -> dict[str, Any]:
-    prompt = _PROPOSAL_PROMPT.format(
-        profile_type=profile_type,
-        requirements_json=json.dumps(requirements_json, indent=2),
-        base_blueprint_json=json.dumps(base_blueprint, indent=2),
-        provider_focus_json=json.dumps(deterministic_module, indent=2),
-    )
     try:
+        prompt = _PROPOSAL_PROMPT.format(
+            profile_type=profile_type,
+            requirements_json=json.dumps(requirements_json, indent=2),
+            base_blueprint_json=json.dumps(base_blueprint, indent=2),
+            provider_focus_json=json.dumps(deterministic_module, indent=2),
+            output_schema_json=_PROPOSAL_OUTPUT_SCHEMA_JSON,
+        )
         result = await _provider_json_request(
             provider=provider,
             builder=builder,
@@ -404,6 +570,10 @@ async def request_provider_proposal(
     return {
         "summary": f"{provider} did not return a structured blueprint proposal.",
         "critical_files": deterministic_module.get("owned_files", [])[:6],
+        "file_tree_delta": deterministic_module.get("owned_files", [])[:6],
+        "api_contracts": [],
+        "data_entities": [],
+        "ui_surfaces": [],
         "module_boundaries": [],
         "integration_risks": [f"{provider} proposal unavailable"],
         "peer_review_focus": deterministic_module.get("review_focus", []),
@@ -429,20 +599,24 @@ async def synthesize_master_blueprint(
         ]
         return fallback
 
-    prompt = _SYNTHESIS_PROMPT.format(
-        profile_type=profile_type,
-        requirements_json=json.dumps(requirements_json, indent=2),
-        base_blueprint_json=json.dumps(base_blueprint, indent=2),
-        deterministic_plan_json=json.dumps(deterministic_plan, indent=2),
-        council_proposals_json=json.dumps(council_proposals, indent=2),
-    )
     try:
-        response = await claude_client.messages.create(
-            model=claude_model,
-            max_tokens=4096,
-            temperature=0.1,
-            system=_SYNTHESIS_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+        prompt = _SYNTHESIS_PROMPT.format(
+            profile_type=profile_type,
+            requirements_json=json.dumps(requirements_json, indent=2),
+            base_blueprint_json=json.dumps(base_blueprint, indent=2),
+            deterministic_plan_json=json.dumps(deterministic_plan, indent=2),
+            council_proposals_json=json.dumps(council_proposals, indent=2),
+            output_schema_json=_SYNTHESIS_OUTPUT_SCHEMA_JSON,
+        )
+        response = await asyncio.wait_for(
+            claude_client.messages.create(
+                model=claude_model,
+                max_tokens=4096,
+                temperature=0.1,
+                system=_SYNTHESIS_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            ),
+            timeout=_SYNTHESIS_TIMEOUT_SECONDS,
         )
         content = "\n".join(
             block.text for block in response.content if getattr(block, "type", "") == "text"
@@ -464,8 +638,12 @@ def merge_master_blueprint(
 ) -> dict[str, Any]:
     merged = dict(deterministic_plan)
     merged["summary"] = synthesized_plan.get("summary") or deterministic_plan.get("summary")
+    merged["council_summary"] = synthesized_plan.get("council_summary") or deterministic_plan.get("council_summary", [])
     merged["shared_contracts"] = synthesized_plan.get("shared_contracts") or deterministic_plan.get("shared_contracts", [])
     merged["integration_notes"] = synthesized_plan.get("integration_notes") or deterministic_plan.get("integration_notes", [])
+    merged["api_contracts"] = _normalize_api_contracts(synthesized_plan.get("api_contracts")) or deterministic_plan.get("api_contracts", [])
+    merged["data_entities"] = _normalize_data_entities(synthesized_plan.get("data_entities")) or deterministic_plan.get("data_entities", [])
+    merged["ui_surfaces"] = _normalize_ui_surfaces(synthesized_plan.get("ui_surfaces")) or deterministic_plan.get("ui_surfaces", [])
     merged["provider_modules"] = {}
 
     deterministic_modules = deterministic_plan.get("provider_modules", {})
@@ -567,14 +745,15 @@ async def request_peer_review(
     target_scope: dict[str, Any],
     target_files: dict[str, str],
 ) -> dict[str, Any]:
-    prompt = _REVIEW_PROMPT.format(
-        reviewer=reviewer,
-        target=target,
-        master_blueprint_json=json.dumps(master_blueprint, indent=2),
-        module_scope_json=json.dumps(target_scope, indent=2),
-        target_files=_format_review_files(target_files),
-    )
     try:
+        prompt = _REVIEW_PROMPT.format(
+            reviewer=reviewer,
+            target=target,
+            master_blueprint_json=json.dumps(master_blueprint, indent=2),
+            module_scope_json=json.dumps(target_scope, indent=2),
+            target_files=_format_review_files(target_files),
+            output_schema_json=_REVIEW_OUTPUT_SCHEMA_JSON,
+        )
         result = await _provider_json_request(
             provider=reviewer,
             builder=reviewer_builder,
@@ -619,24 +798,30 @@ async def _provider_json_request(
     prompt: str,
 ) -> dict[str, Any]:
     if provider in {"openai", "zhipu"}:
-        response = await builder.client.chat.completions.create(
-            model=builder.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
+        response = await asyncio.wait_for(
+            builder.client.chat.completions.create(
+                model=builder.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            ),
+            timeout=_PROVIDER_JSON_TIMEOUT_SECONDS,
         )
         return _parse_json_response(response.choices[0].message.content or "")
 
     if provider == "deepseek":
-        response = await builder.client.chat.completions.create(
-            model=builder.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
+        response = await asyncio.wait_for(
+            builder.client.chat.completions.create(
+                model=builder.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            ),
+            timeout=_PROVIDER_JSON_TIMEOUT_SECONDS,
         )
         return _parse_json_response(response.choices[0].message.content or "")
 

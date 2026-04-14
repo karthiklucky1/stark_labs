@@ -100,26 +100,82 @@ async def _get_session_or_404(
     return session
 
 
+async def _get_latest_spec(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    *,
+    confirmed: bool | None = None,
+) -> RequirementSpec | None:
+    stmt = (
+        select(RequirementSpec)
+        .where(RequirementSpec.session_id == session_id)
+        .order_by(RequirementSpec.version.desc(), RequirementSpec.created_at.desc())
+        .limit(1)
+    )
+    if confirmed is not None:
+        stmt = stmt.where(RequirementSpec.confirmed == confirmed)
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
+
+async def _get_latest_baseline_candidate(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+) -> BuildCandidate | None:
+    result = await db.execute(
+        select(BuildCandidate)
+        .where(BuildCandidate.session_id == session_id)
+        .where(BuildCandidate.is_baseline == True)
+        .order_by(
+            BuildCandidate.updated_at.desc(),
+            BuildCandidate.created_at.desc(),
+            BuildCandidate.id.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def _get_latest_built_candidate(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+) -> BuildCandidate | None:
+    result = await db.execute(
+        select(BuildCandidate)
+        .where(BuildCandidate.session_id == session_id)
+        .where(BuildCandidate.status == "built")
+        .order_by(
+            BuildCandidate.updated_at.desc(),
+            BuildCandidate.created_at.desc(),
+            BuildCandidate.id.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
 def _resolve_preview_runtime(
     session: ProjectSession,
     spec: RequirementSpec | None,
     files: dict[str, str] | None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     files = files or {}
     profile = get_profile(
         session.profile_type or "unsupported",
         blueprint=spec.blueprint_json if spec else None,
     )
     startup_cmd = profile.startup_command
+    install_cmd = profile.install_command
     smoke_config = profile.get_smoke_test_config()
     preview_mode = profile.preview_mode
     health_path = smoke_config.get("health_endpoint", "/health") or "/health"
     page_path = smoke_config.get("page_endpoint", "/") or "/"
 
-    if files and (not startup_cmd or profile.name in {"dynamic_profile", "unsupported"}):
+    if files and (not startup_cmd or not install_cmd or profile.name in {"dynamic_profile", "unsupported"}):
         detected = detect_profile(files)
         if detected.name != "unsupported":
             startup_cmd = detected.startup_command
+            install_cmd = detected.install_command or install_cmd
             detected_smoke_config = detected.get_smoke_test_config()
             preview_mode = detected.preview_mode
             if profile.name == "unsupported":
@@ -127,7 +183,7 @@ def _resolve_preview_runtime(
                 page_path = detected_smoke_config.get("page_endpoint", page_path) or page_path
 
     probe_path = page_path if preview_mode == "iframe" else health_path
-    return startup_cmd, probe_path
+    return startup_cmd, install_cmd, probe_path
 
 
 def _resolve_preview_mode(
@@ -206,13 +262,7 @@ async def _resolve_preview_state(
     db: AsyncSession,
 ) -> dict[str, str | None]:
     session = await _get_session_or_404(session_id, db)
-
-    result = await db.execute(
-        select(BuildCandidate)
-        .where(BuildCandidate.session_id == session_id)
-        .where(BuildCandidate.is_baseline == True)
-    )
-    baseline = result.scalar_one_or_none()
+    baseline = await _get_latest_baseline_candidate(db, session_id)
 
     if not baseline:
         return {"session_id": str(session_id), "preview_url": None, "status": "unavailable"}
@@ -235,13 +285,7 @@ async def _resolve_preview_state(
             "detail": "Sandbox expired, initiating autonomous recovery",
         }
 
-    result = await db.execute(
-        select(RequirementSpec)
-        .where(RequirementSpec.session_id == session_id)
-        .where(RequirementSpec.confirmed == True)
-        .order_by(RequirementSpec.version.desc())
-    )
-    spec = result.scalar_one_or_none()
+    spec = await _get_latest_spec(db, session_id, confirmed=True)
 
     repair_files, files_changed = repair_nextjs_project_files(baseline.files_json or {})
     if files_changed:
@@ -253,7 +297,7 @@ async def _resolve_preview_state(
             "detail": "Repairing generated Next.js project files and restarting preview",
         }
 
-    startup_cmd, health_path = _resolve_preview_runtime(
+    startup_cmd, _install_cmd, health_path = _resolve_preview_runtime(
         session,
         spec,
         repair_files,
@@ -308,28 +352,17 @@ async def _restart_preview_process(session_id: uuid.UUID) -> None:
             if session is None:
                 return
 
-            baseline_result = await db.execute(
-                select(BuildCandidate)
-                .where(BuildCandidate.session_id == session_id)
-                .where(BuildCandidate.is_baseline == True)
-            )
-            baseline = baseline_result.scalar_one_or_none()
+            baseline = await _get_latest_baseline_candidate(db, session_id)
             if baseline is None or not baseline.sandbox_id:
                 return
 
-            spec_result = await db.execute(
-                select(RequirementSpec)
-                .where(RequirementSpec.session_id == session_id)
-                .where(RequirementSpec.confirmed == True)
-                .order_by(RequirementSpec.version.desc())
-            )
-            spec = spec_result.scalar_one_or_none()
+            spec = await _get_latest_spec(db, session_id, confirmed=True)
 
             repair_files, files_changed = repair_nextjs_project_files(baseline.files_json or {})
             if files_changed:
                 baseline.files_json = repair_files
 
-            startup_cmd, health_path = _resolve_preview_runtime(
+            startup_cmd, install_cmd, health_path = _resolve_preview_runtime(
                 session,
                 spec,
                 repair_files,
@@ -340,6 +373,12 @@ async def _restart_preview_process(session_id: uuid.UUID) -> None:
 
             try:
                 await sandbox_manager.upload_files(baseline.sandbox_id, repair_files)
+                await sandbox_manager.ensure_preview_dependencies(
+                    baseline.sandbox_id,
+                    install_cmd=install_cmd,
+                    startup_cmd=startup_cmd,
+                    files=repair_files,
+                )
                 new_url = await sandbox_manager.start_preview(
                     baseline.sandbox_id,
                     startup_cmd,
@@ -377,13 +416,7 @@ async def _classify_change_request_bg(
         if not change_req:
             return
 
-        spec_result = await db.execute(
-            select(RequirementSpec)
-            .where(RequirementSpec.session_id == session_id)
-            .where(RequirementSpec.confirmed == True)
-            .order_by(RequirementSpec.version.desc())
-        )
-        spec = spec_result.scalar_one_or_none()
+        spec = await _get_latest_spec(db, session_id, confirmed=True)
         requirements = spec.requirements_json if spec else {}
 
         sess_result = await db.execute(
@@ -568,13 +601,7 @@ async def confirm_requirements(
     """User confirms the RequirementSpec — triggers the parallel build phase."""
     session = await _get_session_or_404(session_id, db)
 
-    result = await db.execute(
-        select(RequirementSpec)
-        .where(RequirementSpec.session_id == session_id)
-        .where(RequirementSpec.confirmed == False)
-        .order_by(RequirementSpec.version.desc())
-    )
-    spec = result.scalar_one_or_none()
+    spec = await _get_latest_spec(db, session_id, confirmed=False)
     if spec is None:
         raise HTTPException(status_code=404, detail="No unconfirmed requirement spec found")
 
@@ -613,13 +640,7 @@ async def start_build(
     """Manually kick off the parallel build (if not auto-started by confirm)."""
     session = await _get_session_or_404(session_id, db)
 
-    result = await db.execute(
-        select(RequirementSpec)
-        .where(RequirementSpec.session_id == session_id)
-        .where(RequirementSpec.confirmed == True)
-        .order_by(RequirementSpec.version.desc())
-    )
-    spec = result.scalar_one_or_none()
+    spec = await _get_latest_spec(db, session_id, confirmed=True)
     if spec is None:
         raise HTTPException(status_code=400, detail="Requirements must be confirmed before building")
 
@@ -695,12 +716,7 @@ async def start_hardening(
     """Manually start the Mark II hardening loop (auto-started after judging)."""
     session = await _get_session_or_404(session_id, db)
 
-    result = await db.execute(
-        select(BuildCandidate)
-        .where(BuildCandidate.session_id == session_id)
-        .where(BuildCandidate.is_baseline == True)
-    )
-    baseline = result.scalar_one_or_none()
+    baseline = await _get_latest_baseline_candidate(db, session_id)
     if baseline is None:
         raise HTTPException(status_code=400, detail="No baseline candidate selected")
 
@@ -789,20 +805,8 @@ async def get_session_detail(
         _queue_session_task_once(background_tasks, session_id, orchestrator.start_hardening)
         logger.info("Auto-resuming stale hardening session %s", session_id)
 
-    spec_result = await db.execute(
-        select(RequirementSpec)
-        .where(RequirementSpec.session_id == session_id)
-        .order_by(RequirementSpec.version.desc())
-    )
-    spec = spec_result.scalar_one_or_none()
-
-    baseline_result = await db.execute(
-        select(BuildCandidate)
-        .where(BuildCandidate.session_id == session_id)
-        .where(BuildCandidate.is_baseline == True)
-        .order_by(BuildCandidate.created_at.desc())
-    )
-    baseline = baseline_result.scalar_one_or_none()
+    spec = await _get_latest_spec(db, session_id)
+    baseline = await _get_latest_baseline_candidate(db, session_id)
     preview_mode = _resolve_preview_mode(
         session,
         spec,
@@ -971,7 +975,9 @@ async def get_session_marks(
             "result_type": _derive_mark_result_type(r),
             "failure_type": r.failure_type,
             "rejection_reason": r.rejection_reason,
+            "swarm_report_json": r.swarm_report_json or {},
             "patch_summary": r.patch_summary,
+            "repair_provider": r.repair_provider,
             "score": r.score,
         }
         for r in runs
@@ -992,8 +998,9 @@ async def get_judge_decision(
         select(JudgeDecision)
         .where(JudgeDecision.session_id == session_id)
         .order_by(JudgeDecision.created_at.desc())
+        .limit(1)
     )
-    decision = result.scalar_one_or_none()
+    decision = result.scalars().first()
     if not decision:
         return {"winner": None, "reasoning": None, "scores": {}}
 
@@ -1025,22 +1032,11 @@ async def get_artifacts(
     await _get_session_or_404(session_id, db)
 
     # Prefer the most recently repaired (highest-mark) candidate with files
-    result = await db.execute(
-        select(BuildCandidate)
-        .where(BuildCandidate.session_id == session_id)
-        .where(BuildCandidate.is_baseline == True)
-    )
-    baseline = result.scalar_one_or_none()
+    baseline = await _get_latest_baseline_candidate(db, session_id)
 
     # Fallback: any built candidate if baseline not set yet
     if not baseline:
-        result = await db.execute(
-            select(BuildCandidate)
-            .where(BuildCandidate.session_id == session_id)
-            .where(BuildCandidate.status == "built")
-            .order_by(BuildCandidate.created_at.desc())
-        )
-        baseline = result.scalar_one_or_none()
+        baseline = await _get_latest_built_candidate(db, session_id)
 
     files = {}
     if baseline and baseline.files_json:
@@ -1069,12 +1065,7 @@ async def generate_showcase(
 ):
     """Trigger the autonomous generation of a project showcase."""
     # Check if baseline exists
-    result = await db.execute(
-        select(BuildCandidate)
-        .where(BuildCandidate.session_id == session_id)
-        .where(BuildCandidate.is_baseline == True)
-    )
-    baseline = result.scalar_one_or_none()
+    baseline = await _get_latest_baseline_candidate(db, session_id)
     if not baseline:
         raise HTTPException(status_code=400, detail="Cannot generate showcase: No baseline candidate selected.")
 
@@ -1093,18 +1084,16 @@ async def get_showcase(
     """Retrieve the showcase for a session. Auto-generates if missing."""
     from app.models.showcase import SessionShowcase
     result = await db.execute(
-        select(SessionShowcase).where(SessionShowcase.session_id == session_id)
+        select(SessionShowcase)
+        .where(SessionShowcase.session_id == session_id)
+        .order_by(SessionShowcase.created_at.desc(), SessionShowcase.id.desc())
+        .limit(1)
     )
-    showcase = result.scalar_one_or_none()
+    showcase = result.scalars().first()
     
     if not showcase:
         # Check if we can auto-generate
-        result = await db.execute(
-            select(BuildCandidate)
-            .where(BuildCandidate.session_id == session_id)
-            .where(BuildCandidate.is_baseline == True)
-        )
-        baseline = result.scalar_one_or_none()
+        baseline = await _get_latest_baseline_candidate(db, session_id)
         if baseline:
             logger.info("Self-healing: Auto-generating missing showcase for session %s", session_id)
             showcase = await showcase_service.generate_showcase(session_id)

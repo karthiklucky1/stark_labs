@@ -1,12 +1,12 @@
 # Stark Labs
 
-Stark Labs is a build-review-harden workspace centered around **Mark II Studio**, a full-stack app that takes a product idea or an existing codebase, interviews the user for requirements, generates candidates with multiple LLM providers, judges the result, and then hardens the winning build.
+Stark Labs is a build-review-harden workspace centered around **Stark Studio** / **Mark II Studio**, a full-stack app that takes a product idea or an existing codebase, interviews the user for requirements, plans architecture with multiple models, assembles a working build, deploys a live preview, hardens the result, and delivers the final artifacts.
 
 The repo also contains the lower-level `mark_ii` engine, sandbox helpers, and a VS Code extension that can connect to the Studio backend.
 
-## What Mark II Studio does
+## What Stark Studio does
 
-Mark II Studio is designed around a simple pipeline:
+Stark Studio is designed around a staged pipeline:
 
 1. Intake
    - Start from a prompt
@@ -14,31 +14,70 @@ Mark II Studio is designed around a simple pipeline:
    - Paste one file or multiple fenced files directly into the UI
 2. Interview
    - Claude asks focused follow-up questions
+   - OpenAI can fall back when Anthropic is unavailable
    - Existing code intake is analyzed first, then gaps are clarified
 3. Spec review
    - Requirements and blueprint are captured in a structured spec
-4. Build
-   - Multiple builders can run in parallel
-   - Candidates are uploaded to isolated sandboxes
-5. Judge
-   - Claude compares the candidates and selects a baseline
-6. Harden
-   - The Mark II loop runs adversarial validation and targeted repairs
-7. Delivery
-   - Final artifacts, preview, and showcase links are exposed in the UI
+4. Council blueprint
+   - Planned builders propose architecture and module ownership
+   - A synthesized master blueprint defines shared contracts
+5. Assembly
+   - Builders receive scoped briefs instead of the raw full spec
+   - Contributors build owned module surfaces in parallel
+6. Peer review and synthesis
+   - Cross-model advisory review is collected
+   - Critical review findings can trigger a scoped rewrite gate before synthesis
+   - A synthesized baseline is persisted as the final build candidate
+7. Preview
+   - The chosen build is uploaded to an isolated sandbox
+   - Web and API previews are restored automatically when possible
+8. Harden
+   - The Mark II loop runs adversarial validation, classifies results, and applies targeted repairs
+9. Delivery
+   - Final artifacts, showcase data, session metrics, and exportable reports are exposed in the UI
 
 ## Main capabilities
 
 - Prompt, GitHub, and paste-based project intake
 - Reverse interview with Claude for requirement discovery
 - Parallel builder execution with OpenAI, DeepSeek, Zhipu, and optional Ollama
-- Structured judging of generated candidates
-- Live sandbox previews
+- `Fast`, `Balanced`, and `Max Quality` build modes
+- Council-style blueprint synthesis and shared contracts
+- Module-scoped assembly briefs instead of full-spec fanout
+- Peer-review rewrite gate before final synthesis
+- Structured judging and synthesized baseline selection
+- Live sandbox previews with dependency-aware recovery
 - API Playground mode for API projects
 - Responsive iframe preview mode for web apps
-- Hardening loop with patch-based repairs
+- Hardening loop with breach / inconclusive / pass classification
+- Hardening evidence dashboard and repair summaries
+- Session report export from the Delivery tab
 - SSE-driven session UI for live updates
 - VS Code extension under `studio/vscode`
+
+## Build modes and assembly protocol
+
+The current build system supports three execution modes:
+
+- `Fast`
+  - Single-builder path optimized for speed
+- `Balanced`
+  - Multi-model build with synthesis and peer-review visibility
+- `Max Quality`
+  - Broader provider plan with a heavier synthesis / hardening emphasis
+
+The assembly flow is:
+
+1. Council
+   - Providers draft architecture proposals
+2. Blueprint
+   - Shared file ownership, routes, entities, UI surfaces, and API contracts are synthesized
+3. Assembly
+   - Contributors build owned modules from scoped briefs
+4. Peer-review lattice
+   - Contributors review each other and can trigger one rewrite-gated correction pass
+5. Synthesis
+   - A final baseline is assembled and stored for preview, hardening, and delivery
 
 ## Supported project types
 
@@ -75,8 +114,13 @@ stark_labs/
   - Interview, build, preview, delivery, and SSE orchestration hooks
 - `studio/backend/app/services/orchestrator.py`
   - State machine for `created -> interviewing -> spec_review -> building -> judging -> hardening -> complete`
+  - Council, blueprint, peer-review, synthesis, and rerun handling
 - `studio/backend/app/services/sandbox.py`
-  - E2B sandbox lifecycle, preview startup, service URL resolution
+  - E2B sandbox lifecycle, preview startup, dependency repair, service URL resolution
+- `studio/backend/app/services/assembly.py`
+  - Council proposal synthesis, module ownership, peer review, and assembly metadata
+- `studio/backend/app/services/hardening.py`
+  - Adversarial hardening loop, evidence capture, classification, and repair flow
 - `mark_ii/`
   - Patch planning, repair application, memory, validation, and strike logic
 
@@ -86,6 +130,7 @@ stark_labs/
   - Landing page and intake entrypoint
 - `studio/frontend/src/app/session/[id]/page.tsx`
   - Main session workspace with Interview / Build / Harden / Delivery tabs
+  - Build provenance, hardening evidence, and report export UI
 - `studio/frontend/src/components/PreviewSystem.tsx`
   - Sidebar preview renderer
   - Chooses iframe mode for web apps and API Playground mode for API sessions
@@ -184,6 +229,13 @@ The preview sidebar supports two modes:
 
 Preview requests are proxied through the backend so the UI does not depend on browser CORS behavior when talking to sandboxed services.
 
+Preview restoration now also:
+
+- resolves the correct runtime port for the built project
+- installs missing preview dependencies inside the sandbox when required
+- repairs stale preview URLs for restarted or restored sessions
+- avoids browser-side direct health probing for sandbox reachability
+
 ## Paste intake format
 
 The home page supports:
@@ -231,6 +283,7 @@ The extension lives under `studio/vscode` and is intended to connect to the same
 - The frontend runs on port `3000`; the backend runs on port `8000`.
 - Some workflows can boot locally without all providers configured, but missing API keys will disable or degrade the corresponding features.
 - If Anthropic is not configured, interview/spec generation falls back to a reduced auto-generated path.
+- Session reruns can create multiple specs or baseline candidates; the backend now resolves the latest valid row deterministically for preview, showcase, hardening, and delivery endpoints.
 
 ## Useful commands
 

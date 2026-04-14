@@ -94,6 +94,51 @@ function buildScoreSummary(rawScore: any): { judgeScore: string; strongest: stri
   };
 }
 
+function getPhaseResultType(phase: any): 'passed' | 'breach' | 'inconclusive' {
+  const outcome = String(phase?.metrics?.outcome || '').toLowerCase();
+  if (outcome === 'breach') return 'breach';
+  if (['execution_failed', 'judge_unavailable', 'probe_synthesis_failed', 'inconclusive'].includes(outcome)) {
+    return 'inconclusive';
+  }
+  if (phase?.critical && !phase?.passed) return 'breach';
+  if (!phase?.passed) return 'inconclusive';
+  return 'passed';
+}
+
+function getMarkResultType(data: any): 'passed' | 'breach' | 'inconclusive' {
+  const explicit = String(data?.result_type || '').toLowerCase();
+  if (explicit === 'passed' || explicit === 'breach' || explicit === 'inconclusive') {
+    return explicit;
+  }
+  if (data?.passed) return 'passed';
+
+  const phases = Array.isArray(data?.swarm_report_json?.phases) ? data.swarm_report_json.phases : [];
+  if (phases.some((phase: any) => getPhaseResultType(phase) === 'breach')) return 'breach';
+  if (phases.some((phase: any) => getPhaseResultType(phase) === 'inconclusive')) return 'inconclusive';
+  return 'breach';
+}
+
+function summarizeMarkEvidence(data: any) {
+  const phases = Array.isArray(data?.swarm_report_json?.phases) ? data.swarm_report_json.phases : [];
+  const breachPhase = phases.find((phase: any) => getPhaseResultType(phase) === 'breach') || null;
+  const inconclusivePhase = phases.find((phase: any) => getPhaseResultType(phase) === 'inconclusive') || null;
+  const primaryPhase = breachPhase || inconclusivePhase || phases[0] || null;
+  const primaryDetails = Array.isArray(primaryPhase?.details) ? primaryPhase.details.filter(Boolean) : [];
+  const evidence = primaryDetails[0]
+    || (typeof data?.rejection_reason === 'string' && data.rejection_reason.trim())
+    || 'No direct evidence snippet was captured.';
+
+  return {
+    phases,
+    primaryPhase,
+    evidence,
+    verdict: String(data?.swarm_report_json?.summary?.verdict || ''),
+    breachCount: phases.filter((phase: any) => getPhaseResultType(phase) === 'breach').length,
+    inconclusiveCount: phases.filter((phase: any) => getPhaseResultType(phase) === 'inconclusive').length,
+    passedCount: phases.filter((phase: any) => getPhaseResultType(phase) === 'passed').length,
+  };
+}
+
 export default function SessionPage() {
   const { id } = useParams<{ id: string }>();
   const searchParams = useSearchParams();
@@ -191,11 +236,195 @@ export default function SessionPage() {
   const baselineCandidate = candidates.find(candidate => candidate.is_baseline) || candidates.find(candidate => candidate.status === 'built') || null;
   const architecture = sessionData?.architecture_json || {};
   const masterBlueprint = architecture?.master_blueprint || {};
+  const councilSummary = Array.isArray(masterBlueprint?.council_summary) ? masterBlueprint.council_summary : [];
+  const blueprintApiContracts = Array.isArray(masterBlueprint?.api_contracts) ? masterBlueprint.api_contracts : [];
+  const blueprintDataEntities = Array.isArray(masterBlueprint?.data_entities) ? masterBlueprint.data_entities : [];
+  const blueprintUiSurfaces = Array.isArray(masterBlueprint?.ui_surfaces) ? masterBlueprint.ui_surfaces : [];
+  const synthesisSummary = architecture?.synthesis || {};
+  const synthesisContributions = synthesisSummary?.contributions || {};
+  const totalSynthesizedFiles = Object.values(synthesisContributions as Record<string, unknown>).reduce<number>((sum, value) => {
+    const count = typeof value === 'number' ? value : Number(value || 0);
+    return sum + (Number.isFinite(count) ? count : 0);
+  }, 0);
   const architectureStage = typeof architecture?.stage === 'string' ? architecture.stage : 'council';
   const sharedContracts = Array.isArray(masterBlueprint?.shared_contracts) ? masterBlueprint.shared_contracts : [];
   const providerModules = masterBlueprint?.provider_modules || {};
+  const peerReviewEntries: any[] = Array.isArray(architecture?.peer_reviews) ? architecture.peer_reviews : [];
+  const rewriteGateEntries: any[] = Array.isArray(architecture?.rewrite_gate) ? architecture.rewrite_gate : [];
+  const rewriteGateByProvider = rewriteGateEntries.reduce((acc: Record<string, any>, entry: any) => {
+    if (typeof entry?.provider === 'string') acc[entry.provider] = entry;
+    return acc;
+  }, {});
   const visibleBuilders = (plannedBuilders.length > 0 ? plannedBuilders : BUILDER_META.map(item => item.id)).filter((provider: string) => provider !== 'synthesis');
   const contributorCandidates = candidates.filter((candidate: any) => candidate.provider !== 'synthesis' && visibleBuilders.includes(candidate.provider));
+  const completedMarkEvents = markEvents.filter(event => event.event_type === 'mark_result');
+  const hardeningCounts = completedMarkEvents.reduce(
+    (acc, event) => {
+      const resultType = getMarkResultType(event.data);
+      if (resultType === 'passed') acc.passed += 1;
+      else if (resultType === 'breach') acc.breach += 1;
+      else acc.inconclusive += 1;
+      return acc;
+    },
+    { passed: 0, breach: 0, inconclusive: 0 }
+  );
+  const deliveryMetrics = [
+    {
+      label: 'Build Mode',
+      value: formatBuildMode(sessionData?.build_mode),
+      detail: String(architecture?.protocol || 'assembly_v1'),
+    },
+    {
+      label: 'Contributors',
+      value: String(visibleBuilders.length),
+      detail: visibleBuilders.length > 0 ? visibleBuilders.map(formatProviderLabel).join(', ') : 'No contributors planned',
+    },
+    {
+      label: 'Synthesis',
+      value: totalSynthesizedFiles > 0 ? `${totalSynthesizedFiles} files` : 'Pending',
+      detail: baselineCandidate ? `${formatProviderLabel(baselineCandidate.provider)} baseline` : 'No baseline yet',
+    },
+    {
+      label: 'Hardening',
+      value: completedMarkEvents.length > 0 ? `${hardeningCounts.passed}/${completedMarkEvents.length} holds` : 'Pending',
+      detail: `${hardeningCounts.breach} breaches · ${hardeningCounts.inconclusive} inconclusive`,
+    },
+    {
+      label: 'Preview',
+      value: previewStatus ? previewStatus.charAt(0).toUpperCase() + previewStatus.slice(1) : 'Unknown',
+      detail: previewDetail || (previewUrl ? 'Sandbox preview available' : 'Preview not ready'),
+    },
+  ];
+
+  const exportSessionReport = () => {
+    const markResults = completedMarkEvents;
+    const blueprintLines = [
+      `### API Contracts`,
+      ...(blueprintApiContracts.length > 0
+        ? blueprintApiContracts.map((item: any) =>
+            `- ${String(item?.path || item?.route || '/')} · ${
+              Array.isArray(item?.methods) && item.methods.length > 0 ? item.methods.join(', ') : 'GET'
+            }${item?.purpose ? ` · ${String(item.purpose)}` : ''}`
+          )
+        : ['- No route contract recorded.']),
+      ``,
+      `### Data Entities`,
+      ...(blueprintDataEntities.length > 0
+        ? blueprintDataEntities.map((item: any) =>
+            `- ${String(item?.name || item?.entity || 'Entity')} · ${String(item?.shape || item?.description || 'Shape not specified')}`
+          )
+        : ['- No data model recorded.']),
+      ``,
+      `### UI Surfaces`,
+      ...(blueprintUiSurfaces.length > 0
+        ? blueprintUiSurfaces.map((item: any) =>
+            `- ${String(item?.surface || item?.name || 'Surface')} · ${String(item?.purpose || item?.description || 'Primary user surface')}`
+          )
+        : ['- No UI surface map recorded.']),
+    ];
+    const lines = [
+      `# Stark Studios Session Report`,
+      ``,
+      `- Session ID: ${id}`,
+      `- Status: ${status}`,
+      `- Build Mode: ${formatBuildMode(sessionData?.build_mode)}`,
+      `- Profile Type: ${sessionData?.profile_type || 'unknown'}`,
+      `- Architecture Protocol: ${String(architecture?.protocol || 'assembly_v1')}`,
+      `- Architecture Stage: ${String(architecture?.stage || 'unknown')}`,
+      `- Planned Builders: ${visibleBuilders.length > 0 ? visibleBuilders.map(formatProviderLabel).join(', ') : 'n/a'}`,
+      baselineCandidate ? `- Delivery Baseline: ${baselineCandidate.provider.toUpperCase()}` : `- Delivery Baseline: n/a`,
+      previewUrl ? `- Preview URL: ${previewUrl}` : `- Preview URL: unavailable`,
+      ``,
+      `## Prompt`,
+      sessionData?.original_prompt || 'No prompt recorded.',
+      ``,
+      `## Shared Contracts`,
+      ...(sharedContracts.length > 0 ? sharedContracts.map((item: string) => `- ${item}`) : ['- No shared contracts recorded.']),
+      ``,
+      `## Council Consensus`,
+      ...(councilSummary.length > 0 ? councilSummary.map((item: any) => `- ${String(item)}`) : ['- No council consensus notes recorded.']),
+      ``,
+      `## Blueprint Snapshot`,
+      ...blueprintLines,
+      ``,
+      `## Contributors`,
+      ...(contributorCandidates.length > 0
+        ? contributorCandidates.map((candidate: any) => {
+            const provider = candidate.provider;
+            const scorePayload = judgeResult?.scores?.[provider] || null;
+            const scoreSummary = buildScoreSummary(scorePayload);
+            const acceptedCount = Number((synthesisContributions as Record<string, unknown>)?.[provider] || 0);
+            const share = totalSynthesizedFiles > 0 ? `${Math.round((acceptedCount / totalSynthesizedFiles) * 100)}%` : 'n/a';
+            return `- ${formatProviderLabel(provider)}: status=${candidate.status}, score=${scoreSummary.judgeScore}, synthesized_files=${acceptedCount}, synthesis_share=${share}`;
+          })
+        : ['- No contributor candidates recorded.']),
+      ``,
+      `## Peer Review Lattice`,
+      ...(peerReviewEntries.length > 0
+        ? peerReviewEntries.map((entry: any) => {
+            const review = entry?.review || {};
+            const verdict = String(review?.verdict || 'unknown');
+            const issues = Array.isArray(review?.critical_issues) ? review.critical_issues.slice(0, 3) : [];
+            const gate = entry?.rewrite_gate || rewriteGateByProvider[String(entry?.target || '')];
+            const gateSummary = gate?.summary ? ` · rewrite=${String(gate.summary)}` : '';
+            return `- ${formatProviderLabel(String(entry?.reviewer || 'unknown'))} -> ${formatProviderLabel(String(entry?.target || 'unknown'))}: ${verdict}${review?.summary ? ` · ${String(review.summary)}` : ''}${issues.length > 0 ? ` · issues=${issues.join(' | ')}` : ''}${gateSummary}`;
+          })
+        : ['- No peer review records captured.']),
+      ``,
+      `## Rewrite Gate`,
+      ...(rewriteGateEntries.length > 0
+        ? rewriteGateEntries.map((entry: any) =>
+            `- ${formatProviderLabel(String(entry?.provider || 'unknown'))}: status=${String(entry?.status || 'unknown')}, rewrite_applied=${entry?.rewrite_applied ? 'yes' : 'no'}${entry?.target_file ? `, target_file=${String(entry.target_file)}` : ''}${entry?.summary ? ` · ${String(entry.summary)}` : ''}`
+          )
+        : ['- No rewrite-gate activity recorded.']),
+      ``,
+      `## Synthesis Provenance`,
+      ...(visibleBuilders.length > 0
+        ? visibleBuilders.map((provider: string) => {
+            const acceptedCount = Number((synthesisContributions as Record<string, unknown>)?.[provider] || 0);
+            const share = totalSynthesizedFiles > 0 ? `${Math.round((acceptedCount / totalSynthesizedFiles) * 100)}%` : 'n/a';
+            return `- ${formatProviderLabel(provider)}: ${acceptedCount} files kept in synthesis (${share})`;
+          })
+        : ['- No synthesis provenance recorded.']),
+      synthesisSummary?.summary ? `- Synthesis summary: ${String(synthesisSummary.summary)}` : '- Synthesis summary: unavailable',
+      ``,
+      `## Judge Summary`,
+      judgeResult?.winner ? `- Winner: ${String(judgeResult.winner).toUpperCase()}` : '- Winner: n/a',
+      judgeResult?.reasoning ? `- Reasoning: ${judgeResult.reasoning}` : '- Reasoning: not available',
+      ``,
+      `## Delivery Metrics`,
+      ...deliveryMetrics.map(metric => `- ${metric.label}: ${metric.value} (${metric.detail})`),
+      ``,
+      `## Hardening Summary`,
+      `- Marks processed: ${markResults.length}`,
+      `- Armor holds: ${hardeningCounts.passed}`,
+      `- Breaches: ${hardeningCounts.breach}`,
+      `- Inconclusive: ${hardeningCounts.inconclusive}`,
+      ...(
+        markResults.length > 0
+          ? markResults.map((event: any) => {
+              const data = event.data || {};
+              const resultType = getMarkResultType(data);
+              const evidence = summarizeMarkEvidence(data);
+              const repair = data.patch_summary
+                ? `${data.repair_provider ? `${String(data.repair_provider).toUpperCase()} repair` : 'Repair'}: ${String(data.patch_summary)}`
+                : 'No repair recorded';
+              return `- Mark ${data.mark_name || data.mark_number}: ${resultType}${data.failure_type ? ` (${data.failure_type})` : ''} · attack=${String(evidence.primaryPhase?.name || data.failure_type || 'n/a')} · evidence=${String(evidence.evidence).slice(0, 160)} · ${repair}`;
+            })
+          : ['- No hardening results recorded.']
+      ),
+    ];
+
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `stark-session-${id}.md`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
 
   useEffect(() => {
     const fetchSession = async () => {
@@ -250,7 +479,22 @@ export default function SessionPage() {
           const events: SSEEvent[] = [];
           runs.forEach((r: any) => {
             events.push({ event_type: 'mark_started', session_id: id, timestamp: '', data: { mark_number: r.mark_number, mark_name: r.mark_name } });
-            events.push({ event_type: 'mark_result', session_id: id, timestamp: '', data: { mark_number: r.mark_number, mark_name: r.mark_name, passed: r.passed, failure_type: r.failure_type, patch_summary: r.patch_summary } });
+            events.push({
+              event_type: 'mark_result',
+              session_id: id,
+              timestamp: '',
+              data: {
+                mark_number: r.mark_number,
+                mark_name: r.mark_name,
+                passed: r.passed,
+                result_type: r.result_type,
+                failure_type: r.failure_type,
+                rejection_reason: r.rejection_reason,
+                swarm_report_json: r.swarm_report_json,
+                patch_summary: r.patch_summary,
+                repair_provider: r.repair_provider,
+              }
+            });
           });
           setMarkEvents(events);
         })
@@ -276,7 +520,22 @@ export default function SessionPage() {
         const events: SSEEvent[] = [];
         runs.forEach((r: any) => {
           events.push({ event_type: 'mark_started', session_id: id, timestamp: '', data: { mark_number: r.mark_number, mark_name: r.mark_name } });
-          events.push({ event_type: 'mark_result', session_id: id, timestamp: '', data: { mark_number: r.mark_number, mark_name: r.mark_name, passed: r.passed, failure_type: r.failure_type, patch_summary: r.patch_summary } });
+          events.push({
+            event_type: 'mark_result',
+            session_id: id,
+            timestamp: '',
+            data: {
+              mark_number: r.mark_number,
+              mark_name: r.mark_name,
+              passed: r.passed,
+              result_type: r.result_type,
+              failure_type: r.failure_type,
+              rejection_reason: r.rejection_reason,
+              swarm_report_json: r.swarm_report_json,
+              patch_summary: r.patch_summary,
+              repair_provider: r.repair_provider,
+            }
+          });
         });
         setMarkEvents(events);
       })
@@ -627,6 +886,233 @@ export default function SessionPage() {
                     ))}
                   </div>
                 </div>
+
+                <div className="grid grid-cols-1 xl:grid-cols-[1.2fr_1fr] gap-3">
+                  <div className="glass-card p-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                        Blueprint Snapshot
+                      </p>
+                      <span className="text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+                        {blueprintApiContracts.length} routes · {blueprintDataEntities.length} entities · {blueprintUiSurfaces.length} surfaces
+                      </span>
+                    </div>
+
+                    {councilSummary.length > 0 && (
+                      <p className="mt-3 text-sm leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                        {String(councilSummary[0])}
+                      </p>
+                    )}
+
+                    <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+                      <div className="rounded-2xl px-4 py-3"
+                        style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                          API Contracts
+                        </p>
+                        <div className="mt-2 space-y-2">
+                          {blueprintApiContracts.slice(0, 3).map((item: any, index: number) => (
+                            <div key={index}>
+                              <p className="text-sm font-semibold text-white">
+                                {String(item?.path || item?.route || '/')}
+                              </p>
+                              <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                                {Array.isArray(item?.methods) && item.methods.length > 0 ? item.methods.join(', ') : 'GET'}
+                                {item?.purpose ? ` · ${String(item.purpose)}` : ''}
+                              </p>
+                            </div>
+                          ))}
+                          {blueprintApiContracts.length === 0 && (
+                            <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>No route contract recorded.</p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="rounded-2xl px-4 py-3"
+                        style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                          Data Entities
+                        </p>
+                        <div className="mt-2 space-y-2">
+                          {blueprintDataEntities.slice(0, 3).map((item: any, index: number) => (
+                            <div key={index}>
+                              <p className="text-sm font-semibold text-white">
+                                {String(item?.name || item?.entity || 'Entity')}
+                              </p>
+                              <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                                {String(item?.shape || item?.description || 'Shape not specified')}
+                              </p>
+                            </div>
+                          ))}
+                          {blueprintDataEntities.length === 0 && (
+                            <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>No data model recorded.</p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="rounded-2xl px-4 py-3"
+                        style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                          UI Surfaces
+                        </p>
+                        <div className="mt-2 space-y-2">
+                          {blueprintUiSurfaces.slice(0, 3).map((item: any, index: number) => (
+                            <div key={index}>
+                              <p className="text-sm font-semibold text-white">
+                                {String(item?.surface || item?.name || 'Surface')}
+                              </p>
+                              <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                                {String(item?.purpose || item?.description || 'Primary user surface')}
+                              </p>
+                            </div>
+                          ))}
+                          {blueprintUiSurfaces.length === 0 && (
+                            <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>No UI surface map recorded.</p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="glass-card p-5">
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                      Council Consensus
+                    </p>
+                    <div className="mt-4 space-y-3">
+                      {(councilSummary.length > 0 ? councilSummary.slice(0, 4) : [
+                        'Council proposals are being normalized into a shared architecture contract.',
+                      ]).map((item: any, index: number) => (
+                        <p key={index} className="text-sm leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                          {String(item)}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 xl:grid-cols-[1.2fr_0.8fr] gap-3">
+                  <div className="glass-card p-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                          Peer-Review Lattice
+                        </p>
+                        <p className="mt-2 text-sm leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                          Cross-model review edges and rewrite-gate outcomes before synthesis.
+                        </p>
+                      </div>
+                      <span className="text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+                        {peerReviewEntries.length} edges
+                      </span>
+                    </div>
+
+                    <div className="mt-4 space-y-2.5">
+                      {peerReviewEntries.length > 0 ? (
+                        peerReviewEntries.map((entry: any, index: number) => {
+                          const review = entry?.review || {};
+                          const reviewer = String(entry?.reviewer || 'unknown');
+                          const target = String(entry?.target || 'unknown');
+                          const verdict = String(review?.verdict || 'unknown');
+                          const issues = Array.isArray(review?.critical_issues) ? review.critical_issues.slice(0, 2) : [];
+                          const gate = entry?.rewrite_gate || rewriteGateByProvider[target];
+                          const gateStatus = String(gate?.status || (issues.length > 0 ? 'reviewed' : 'approved'));
+                          const gateColor =
+                            gateStatus === 'rewritten' ? 'var(--accent-green)'
+                            : gateStatus === 'failed' ? 'var(--accent-red)'
+                            : gateStatus === 'no_changes' ? 'var(--accent-orange)'
+                            : 'var(--stark-cyan)';
+                          return (
+                            <div key={`${reviewer}-${target}-${index}`} className="rounded-2xl px-4 py-3"
+                              style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                              <div className="flex items-center justify-between gap-3 flex-wrap">
+                                <div className="flex items-center gap-2 text-sm font-semibold text-white">
+                                  <span>{formatProviderLabel(reviewer)}</span>
+                                  <span style={{ color: 'var(--text-muted)' }}>→</span>
+                                  <span>{formatProviderLabel(target)}</span>
+                                </div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-[10px] px-2.5 py-1 rounded-full font-semibold"
+                                    style={{ background: 'rgba(255,255,255,0.06)', color: 'var(--text-secondary)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                                    {verdict}
+                                  </span>
+                                  <span className="text-[10px] px-2.5 py-1 rounded-full font-semibold"
+                                    style={{ background: `${gateColor}18`, color: gateColor, border: `1px solid ${gateColor}30` }}>
+                                    {gateStatus}
+                                  </span>
+                                </div>
+                              </div>
+                              <p className="mt-2 text-sm leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                                {String(review?.summary || gate?.summary || 'Review notes pending.')}
+                              </p>
+                              {issues.length > 0 && (
+                                <div className="mt-2 flex flex-wrap gap-2">
+                                  {issues.map((issue: any, issueIndex: number) => (
+                                    <span key={issueIndex} className="text-[10px] px-2 py-1 rounded-full"
+                                      style={{ background: 'rgba(249,115,22,0.12)', color: 'var(--accent-orange)', border: '1px solid rgba(249,115,22,0.18)' }}>
+                                      {String(issue)}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })
+                      ) : (
+                        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                          Review edges will appear here once contributor modules are available.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="glass-card p-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                          Synthesis Provenance
+                        </p>
+                        <p className="mt-2 text-sm leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                          Shows how much of each contributor survives into the baseline.
+                        </p>
+                      </div>
+                      <span className="text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+                        {totalSynthesizedFiles} files
+                      </span>
+                    </div>
+
+                    <div className="mt-4 space-y-3">
+                      {visibleBuilders.map((provider: string) => {
+                        const acceptedIntoSynthesis = Number((synthesisContributions as Record<string, unknown>)?.[provider] || 0);
+                        const share = totalSynthesizedFiles > 0 ? Math.round((acceptedIntoSynthesis / totalSynthesizedFiles) * 100) : 0;
+                        const scope = providerModules?.[provider] || {};
+                        const moduleName = scope?.module_name || `${formatProviderLabel(provider)} module`;
+                        return (
+                          <div key={provider} className="rounded-2xl px-4 py-3"
+                            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                            <div className="flex items-center justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-semibold text-white">{formatProviderLabel(provider)}</p>
+                                <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{String(moduleName)}</p>
+                              </div>
+                              <div className="text-right">
+                                <p className="text-sm font-semibold text-white">{acceptedIntoSynthesis} files</p>
+                                <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{share}% kept</p>
+                              </div>
+                            </div>
+                            <div className="mt-3 h-1.5 rounded-full overflow-hidden"
+                              style={{ background: 'rgba(255,255,255,0.06)' }}>
+                              <div className="h-full rounded-full"
+                                style={{
+                                  width: `${Math.max(share, acceptedIntoSynthesis > 0 ? 8 : 0)}%`,
+                                  background: 'linear-gradient(90deg, rgba(0,212,255,0.9), rgba(16,185,129,0.9))',
+                                }} />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <div className={`grid ${visibleBuilders.length > 1 ? 'grid-cols-1 xl:grid-cols-2' : 'grid-cols-1'} gap-3 px-6 py-4 shrink-0`}
@@ -767,6 +1253,19 @@ export default function SessionPage() {
                     const scoreSummary = buildScoreSummary(scorePayload);
                     const statusValue = candidate?.status || builderStates[provider]?.status || 'queued';
                     const durationValue = formatDuration(candidate?.build_duration_ms) || 'n/a';
+                    const acceptedIntoSynthesis = Number((synthesisContributions as Record<string, unknown>)?.[provider] || 0);
+                    const synthesisShare = totalSynthesizedFiles > 0
+                      ? `${Math.round((acceptedIntoSynthesis / totalSynthesizedFiles) * 100)}%`
+                      : 'n/a';
+                    const firstReview = reviews[0] || null;
+                    const rewriteApplied = Boolean(firstReview?.rewrite_applied);
+                    const rewriteSummary = typeof firstReview?.rewrite_summary === 'string' && firstReview.rewrite_summary.trim()
+                      ? firstReview.rewrite_summary.trim()
+                      : typeof firstReview?.rewrite_gate?.summary === 'string' && firstReview.rewrite_gate.summary.trim()
+                      ? firstReview.rewrite_gate.summary.trim()
+                      : typeof candidate?.patch_summary === 'string' && candidate.patch_summary.trim()
+                      ? candidate.patch_summary.trim()
+                      : null;
                     const outcomeValue =
                       candidate?.is_baseline
                         ? 'Selected'
@@ -776,7 +1275,9 @@ export default function SessionPage() {
                         ? 'Failed'
                         : 'Waiting';
                     const noteText =
-                      candidate?.build_log
+                      rewriteSummary
+                        ? `Rewrite gate: ${rewriteSummary}`.slice(0, 180)
+                        : candidate?.build_log
                         ? String(candidate.build_log).slice(0, 180)
                         : 'No candidate output yet.';
                     const moduleName = scope?.module_name || `${formatProviderLabel(provider)} module`;
@@ -831,6 +1332,16 @@ export default function SessionPage() {
                           <div className="rounded-2xl px-3 py-2.5"
                             style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
                             <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                              In Synthesis
+                            </p>
+                            <p className="mt-1.5 text-sm font-semibold text-white">
+                              {acceptedIntoSynthesis} files · {synthesisShare}
+                            </p>
+                          </div>
+
+                          <div className="rounded-2xl px-3 py-2.5"
+                            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
                               Strongest
                             </p>
                             <p className="mt-1.5 text-sm font-semibold text-white">{scoreSummary.strongest}</p>
@@ -851,7 +1362,9 @@ export default function SessionPage() {
                             </p>
                             <p className="mt-1.5 text-sm font-medium leading-relaxed text-white">
                               {reviews.length > 0
-                                ? (reviews[0]?.review?.summary || reviews[0]?.summary || 'Review available')
+                                ? rewriteApplied
+                                  ? `${firstReview?.review?.summary || firstReview?.summary || 'Critical concerns were resolved'} Rewrite applied before synthesis.`
+                                  : (firstReview?.review?.summary || firstReview?.summary || 'Review available')
                                 : 'Peer review pending'}
                             </p>
                           </div>
@@ -1033,14 +1546,13 @@ export default function SessionPage() {
                   </span>
                 </div>
                 <span className="text-xs font-mono" style={{ color: 'var(--text-muted)' }}>
-                  {markEvents.filter(e => e.event_type === 'mark_result').length} marks completed
+                  {completedMarkEvents.length} marks processed
                 </span>
               </div>
 
               {/* Mark I–VII stage tracker */}
               {(() => {
-                const completedMarks = markEvents.filter(e => e.event_type === 'mark_result');
-                const completedNums = new Set(completedMarks.map(e => e.data.mark_number as number));
+                const completedNums = new Set(completedMarkEvents.map(e => e.data.mark_number as number));
                 const MARKS = [
                   { num: 1, name: 'Mark I' },
                   { num: 2, name: 'Mark II' },
@@ -1050,37 +1562,56 @@ export default function SessionPage() {
                   { num: 6, name: 'Mark VI' },
                   { num: 7, name: 'Mark VII' },
                 ];
-                const nextNum = completedMarks.length + 1;
+                const nextNum = completedMarkEvents.length + 1;
                 return (
                   <div className="px-6 py-3 shrink-0 flex items-center gap-2 flex-wrap"
                     style={{ borderBottom: '1px solid rgba(255,255,255,0.04)', background: 'rgba(0,0,0,0.15)' }}>
                     {MARKS.map((m, idx) => {
                       const done = completedNums.has(m.num);
                       const running = !done && m.num === nextNum && status === 'hardening';
-                      const pending = !done && !running;
-                      const result = completedMarks.find(e => (e.data.mark_number as number) === m.num);
-                      const passed = result?.data.passed as boolean | undefined;
+                      const result = completedMarkEvents.find(e => (e.data.mark_number as number) === m.num);
+                      const resultType = result ? getMarkResultType(result.data) : null;
                       return (
                         <div key={m.num} className="flex items-center gap-1.5">
                           {idx > 0 && (
-                            <div className="w-4 h-px" style={{ background: done ? 'rgba(16,185,129,0.4)' : 'rgba(255,255,255,0.08)' }} />
+                            <div className="w-4 h-px" style={{
+                              background:
+                                resultType === 'breach' ? 'rgba(255,71,87,0.35)'
+                                : resultType === 'inconclusive' ? 'rgba(249,115,22,0.35)'
+                                : done ? 'rgba(16,185,129,0.4)'
+                                : 'rgba(255,255,255,0.08)'
+                            }} />
                           )}
                           <div className="flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-bold transition-all"
                             style={{
                               background: done
-                                ? (passed ? 'rgba(16,185,129,0.12)' : 'rgba(255,71,87,0.12)')
+                                ? (
+                                    resultType === 'breach' ? 'rgba(255,71,87,0.12)'
+                                    : resultType === 'inconclusive' ? 'rgba(249,115,22,0.12)'
+                                    : 'rgba(16,185,129,0.12)'
+                                  )
                                 : running
                                   ? 'rgba(255,71,87,0.08)'
                                   : 'rgba(255,255,255,0.03)',
-                              border: `1px solid ${done ? (passed ? 'rgba(16,185,129,0.25)' : 'rgba(255,71,87,0.25)') : running ? 'rgba(255,71,87,0.2)' : 'rgba(255,255,255,0.06)'}`,
+                              border: `1px solid ${done
+                                ? (
+                                    resultType === 'breach' ? 'rgba(255,71,87,0.25)'
+                                    : resultType === 'inconclusive' ? 'rgba(249,115,22,0.25)'
+                                    : 'rgba(16,185,129,0.25)'
+                                  )
+                                : running ? 'rgba(255,71,87,0.2)' : 'rgba(255,255,255,0.06)'}`,
                               color: done
-                                ? (passed ? 'var(--accent-green)' : 'var(--accent-red)')
+                                ? (
+                                    resultType === 'breach' ? 'var(--accent-red)'
+                                    : resultType === 'inconclusive' ? 'var(--accent-orange)'
+                                    : 'var(--accent-green)'
+                                  )
                                 : running
                                   ? 'var(--accent-red)'
                                   : 'var(--text-muted)',
                             }}>
                             {done
-                              ? <span>{passed ? '✓' : '✗'}</span>
+                              ? <span>{resultType === 'breach' ? '✗' : resultType === 'inconclusive' ? '○' : '✓'}</span>
                               : running
                                 ? <span style={{ animation: 'pulse-glow 1s ease-in-out infinite', display: 'inline-block' }}>●</span>
                                 : <span>○</span>
@@ -1095,8 +1626,25 @@ export default function SessionPage() {
               })()}
 
               <div className="flex-1 overflow-y-auto p-6 space-y-3">
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                  {[
+                    { label: 'Processed', value: completedMarkEvents.length, color: 'var(--text-primary)' },
+                    { label: 'Armor Holds', value: hardeningCounts.passed, color: 'var(--accent-green)' },
+                    { label: 'Breaches', value: hardeningCounts.breach, color: 'var(--accent-red)' },
+                    { label: 'Inconclusive', value: hardeningCounts.inconclusive, color: 'var(--accent-orange)' },
+                  ].map((item) => (
+                    <div key={item.label} className="glass-card px-4 py-3"
+                      style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                        {item.label}
+                      </p>
+                      <p className="mt-2 text-2xl font-semibold" style={{ color: item.color }}>{item.value}</p>
+                    </div>
+                  ))}
+                </div>
+
                 {/* Live running indicator */}
-                {status === 'hardening' && markEvents.filter(e => e.event_type === 'mark_result').length === 0 && (
+                {status === 'hardening' && completedMarkEvents.length === 0 && (
                   <div className="glass-card p-5 flex items-center gap-4"
                     style={{ borderColor: 'rgba(255,71,87,0.15)', background: 'rgba(255,71,87,0.03)' }}>
                     <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0"
@@ -1114,6 +1662,9 @@ export default function SessionPage() {
 
                 {markEvents.map((e, i) => {
                   if (e.event_type === 'mark_started') {
+                    if (completedMarkEvents.some(result => (result.data.mark_number as number) === (e.data.mark_number as number))) {
+                      return null;
+                    }
                     return (
                       <div key={i} className="flex items-center gap-3 px-2 py-3" style={{ color: 'var(--text-muted)' }}>
                         <div className="status-dot" style={{ background: 'var(--accent-red)', animation: 'pulse-glow 1s ease-in-out infinite' }} />
@@ -1122,23 +1673,53 @@ export default function SessionPage() {
                     );
                   }
 
-                  const passed = e.data.passed as boolean;
+                  const resultType = getMarkResultType(e.data);
+                  const passed = resultType === 'passed';
                   const markName = e.data.mark_name as string;
                   const failureType = e.data.failure_type as string | null;
                   const patchSummary = e.data.patch_summary as string | null;
                   const markNumber = e.data.mark_number as number;
+                  const repairProvider = e.data.repair_provider as string | null;
+                  const evidence = summarizeMarkEvidence(e.data);
+                  const badgeColor =
+                    resultType === 'breach' ? 'var(--accent-red)'
+                    : resultType === 'inconclusive' ? 'var(--accent-orange)'
+                    : 'var(--accent-green)';
+                  const badgeBg =
+                    resultType === 'breach' ? 'rgba(255,71,87,0.12)'
+                    : resultType === 'inconclusive' ? 'rgba(249,115,22,0.12)'
+                    : 'rgba(16,185,129,0.12)';
+                  const borderColor =
+                    resultType === 'breach' ? 'rgba(255,71,87,0.2)'
+                    : resultType === 'inconclusive' ? 'rgba(249,115,22,0.22)'
+                    : 'rgba(16,185,129,0.2)';
+                  const cardBg =
+                    resultType === 'breach' ? 'rgba(255,71,87,0.02)'
+                    : resultType === 'inconclusive' ? 'rgba(249,115,22,0.03)'
+                    : 'rgba(16,185,129,0.02)';
+                  const repairLabel = patchSummary
+                    ? `${repairProvider ? `${String(repairProvider).toUpperCase()} repair` : 'Repair action'}: ${patchSummary}`
+                    : resultType === 'passed'
+                    ? 'No repair required.'
+                    : resultType === 'inconclusive'
+                    ? 'No repair was applied because the attack result was inconclusive.'
+                    : 'No repair action recorded.';
+                  const verdictLabel =
+                    resultType === 'breach' ? '✗ Breach detected'
+                    : resultType === 'inconclusive' ? '○ Inconclusive'
+                    : '✓ Armor holds';
 
                   return (
                     <div key={i} className="glass-card p-5 flex items-start gap-4"
                       style={{
-                        borderColor: passed ? 'rgba(16,185,129,0.2)' : 'rgba(255,71,87,0.2)',
-                        background: passed ? 'rgba(16,185,129,0.02)' : 'rgba(255,71,87,0.02)',
+                        borderColor,
+                        background: cardBg,
                       }}>
                       {/* Mark number badge */}
                       <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 font-bold text-sm"
                         style={{
-                          background: passed ? 'rgba(16,185,129,0.12)' : 'rgba(255,71,87,0.12)',
-                          color: passed ? 'var(--accent-green)' : 'var(--accent-red)',
+                          background: badgeBg,
+                          color: badgeColor,
                         }}>
                         {markNumber}
                       </div>
@@ -1148,30 +1729,89 @@ export default function SessionPage() {
                           <span className="text-sm font-semibold text-white">Mark {markName}</span>
                           <span className="text-xs font-bold px-2 py-0.5 rounded-full"
                             style={{
-                              background: passed ? 'rgba(16,185,129,0.12)' : 'rgba(255,71,87,0.12)',
-                              color: passed ? 'var(--accent-green)' : 'var(--accent-red)',
+                              background: badgeBg,
+                              color: badgeColor,
                             }}>
-                            {passed ? '✓ Armor holds' : '✗ Breach detected'}
+                            {verdictLabel}
                           </span>
                         </div>
 
-                        {failureType && (
-                          <p className="text-xs mb-1.5 font-mono" style={{ color: 'var(--accent-red)' }}>
-                            Vulnerability: {failureType}
+                        <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-2">
+                          <div className="rounded-2xl px-3 py-2.5"
+                            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                              Primary Attack
+                            </p>
+                            <p className="mt-1.5 text-sm font-semibold text-white">
+                              {String(evidence.primaryPhase?.name || failureType || 'Armor Hold')}
+                            </p>
+                          </div>
+                          <div className="rounded-2xl px-3 py-2.5"
+                            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                              Wave Mix
+                            </p>
+                            <p className="mt-1.5 text-sm font-semibold text-white">
+                              {evidence.passedCount} pass · {evidence.breachCount} breach · {evidence.inconclusiveCount} inconclusive
+                            </p>
+                          </div>
+                          <div className="rounded-2xl px-3 py-2.5"
+                            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                              Final State
+                            </p>
+                            <p className="mt-1.5 text-sm font-semibold text-white">
+                              {evidence.verdict || verdictLabel.replace(/^.[ ]*/, '')}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {evidence.phases.slice(0, 4).map((phase: any, phaseIndex: number) => {
+                            const phaseType = getPhaseResultType(phase);
+                            const phaseColor =
+                              phaseType === 'breach' ? 'var(--accent-red)'
+                              : phaseType === 'inconclusive' ? 'var(--accent-orange)'
+                              : 'var(--accent-green)';
+                            const phaseBg =
+                              phaseType === 'breach' ? 'rgba(255,71,87,0.12)'
+                              : phaseType === 'inconclusive' ? 'rgba(249,115,22,0.12)'
+                              : 'rgba(16,185,129,0.12)';
+                            return (
+                              <span key={phaseIndex} className="text-[10px] px-2.5 py-1 rounded-full font-semibold"
+                                style={{ background: phaseBg, color: phaseColor, border: `1px solid ${phaseBg}` }}>
+                                {String(phase?.name || `Wave ${phaseIndex + 1}`)}
+                              </span>
+                            );
+                          })}
+                        </div>
+
+                        <div className="mt-3 rounded-2xl px-4 py-3"
+                          style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                            Evidence
                           </p>
-                        )}
-                        {patchSummary && (
-                          <p className="text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>
-                            🔧 {patchSummary}
+                          <p className="mt-2 text-sm leading-relaxed text-white">
+                            {String(evidence.evidence)}
                           </p>
-                        )}
+                        </div>
+
+                        <div className="mt-2 rounded-2xl px-4 py-3"
+                          style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.04)' }}>
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                            Repair Action
+                          </p>
+                          <p className="mt-2 text-sm leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                            {repairLabel}
+                          </p>
+                        </div>
                       </div>
                     </div>
                   );
                 })}
 
                 {/* Still hardening — waiting for more marks */}
-                {status === 'hardening' && markEvents.filter(e => e.event_type === 'mark_result').length > 0 && (
+                {status === 'hardening' && completedMarkEvents.length > 0 && (
                   <div className="flex items-center gap-3 px-2 py-3" style={{ color: 'var(--text-muted)' }}>
                     <div className="status-dot" style={{ background: 'var(--accent-red)', animation: 'pulse-glow 1s ease-in-out infinite' }} />
                     <span className="text-xs">Next mark running…</span>
@@ -1201,6 +1841,11 @@ export default function SessionPage() {
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  <button className="text-xs px-3 py-1.5 rounded-lg font-semibold transition-all"
+                    style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)', color: 'var(--text-primary)' }}
+                    onClick={exportSessionReport}>
+                    Export Report
+                  </button>
                   {previewUrl && previewStatus === 'active' && (
                     <a href={previewUrl} target="_blank" rel="noreferrer"
                       className="text-xs px-3 py-1.5 rounded-lg font-semibold transition-all"
@@ -1226,6 +1871,20 @@ export default function SessionPage() {
               </div>
 
               <div className="flex-1 min-h-0 overflow-y-auto p-6 pt-5">
+                <div className="grid grid-cols-2 xl:grid-cols-5 gap-3 mb-5">
+                  {deliveryMetrics.map((metric) => (
+                    <div key={metric.label} className="glass-card px-4 py-3"
+                      style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--text-muted)' }}>
+                        {metric.label}
+                      </p>
+                      <p className="mt-2 text-lg font-semibold text-white">{metric.value}</p>
+                      <p className="mt-1 text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                        {metric.detail}
+                      </p>
+                    </div>
+                  ))}
+                </div>
                 <ArtifactsViewer sessionId={id} />
               </div>
             </div>

@@ -54,6 +54,37 @@ Output EXACTLY this JSON:
 class ShowcaseService:
     """Service to handle autonomous project showcase generation."""
 
+    async def _get_latest_baseline_candidate(
+        self,
+        db: AsyncSession,
+        session_id: uuid.UUID,
+    ) -> Optional[BuildCandidate]:
+        result = await db.execute(
+            select(BuildCandidate)
+            .where(BuildCandidate.session_id == session_id)
+            .where(BuildCandidate.is_baseline == True)
+            .order_by(
+                BuildCandidate.updated_at.desc(),
+                BuildCandidate.created_at.desc(),
+                BuildCandidate.id.desc(),
+            )
+            .limit(1)
+        )
+        return result.scalars().first()
+
+    async def _get_latest_showcase(
+        self,
+        db: AsyncSession,
+        session_id: uuid.UUID,
+    ) -> Optional[SessionShowcase]:
+        result = await db.execute(
+            select(SessionShowcase)
+            .where(SessionShowcase.session_id == session_id)
+            .order_by(SessionShowcase.created_at.desc(), SessionShowcase.id.desc())
+            .limit(1)
+        )
+        return result.scalars().first()
+
     async def generate_showcase(self, session_id: uuid.UUID) -> Optional[SessionShowcase]:
         """
         Analyze the baseline candidate and generate a premium showcase.
@@ -67,12 +98,7 @@ class ShowcaseService:
                 return None
 
             # Get the baseline candidate (the one being showcased)
-            candidate_result = await db.execute(
-                select(BuildCandidate)
-                .where(BuildCandidate.session_id == session_id)
-                .where(BuildCandidate.is_baseline == True)
-            )
-            candidate = candidate_result.scalar_one_or_none()
+            candidate = await self._get_latest_baseline_candidate(db, session_id)
             if not candidate:
                 logger.warning("No baseline candidate found for showcase generation in session %s", session_id)
                 return None
@@ -81,15 +107,16 @@ class ShowcaseService:
             chronicle_data = await self._call_stark_publicist(session, candidate)
             
             # 2. Persist the showcase
-            showcase = SessionShowcase(
-                session_id=session_id,
-                title=chronicle_data.get("title", "Unnamed Innovation"),
-                marketing_pitch=chronicle_data.get("marketing_pitch", ""),
-                demo_script_json=chronicle_data.get("demo_script", []),
-                telemetry_highlights_json=chronicle_data.get("highlights", {}),
-                is_public=True
-            )
-            db.add(showcase)
+            showcase = await self._get_latest_showcase(db, session_id)
+            if showcase is None:
+                showcase = SessionShowcase(session_id=session_id, is_public=True)
+                db.add(showcase)
+
+            showcase.title = chronicle_data.get("title", "Unnamed Innovation")
+            showcase.marketing_pitch = chronicle_data.get("marketing_pitch", "")
+            showcase.demo_script_json = chronicle_data.get("demo_script", [])
+            showcase.telemetry_highlights_json = chronicle_data.get("highlights", {})
+            showcase.is_public = True
             await db.commit()
             await db.refresh(showcase)
             
@@ -115,7 +142,7 @@ Example code snippet (main logic):
 """
 
             response = await client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model=settings.claude_judge_model or "claude-sonnet-4-20250514",
                 max_tokens=4096,
                 temperature=0.7,
                 system=CHRONICLE_SYSTEM_PROMPT,

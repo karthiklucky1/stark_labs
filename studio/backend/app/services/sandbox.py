@@ -202,7 +202,64 @@ class SandboxManager:
 
     async def install_deps(self, sandbox_id: str, profile_install_cmd: str) -> CommandResult:
         """Install project dependencies in a sandbox."""
-        return await self.run_command(sandbox_id, profile_install_cmd)
+        sandbox = await self._ensure_sandbox(sandbox_id)
+
+        if isinstance(sandbox, dict) and sandbox.get("mock"):
+            logger.info("Mock dependency install in %s: %s", sandbox_id, profile_install_cmd)
+            return CommandResult(exit_code=0, stdout="mock install", stderr="")
+
+        result = await sandbox.commands.run(
+            profile_install_cmd,
+            cwd="/home/user",
+            timeout=max(int(getattr(settings, "max_build_timeout_s", 300) or 300), 300),
+            request_timeout=0,
+        )
+        return CommandResult(
+            exit_code=result.exit_code,
+            stdout=result.stdout or "",
+            stderr=result.stderr or "",
+        )
+
+    async def ensure_preview_dependencies(
+        self,
+        sandbox_id: str,
+        *,
+        install_cmd: str | None,
+        startup_cmd: str | None,
+        files: dict[str, str] | None = None,
+    ) -> None:
+        """Install preview dependencies only when the sandbox is clearly missing them."""
+        install_cmd = (install_cmd or "").strip()
+        if not install_cmd:
+            return
+
+        sandbox = await self._ensure_sandbox(sandbox_id)
+        if isinstance(sandbox, dict) and sandbox.get("mock"):
+            return
+
+        files = files or {}
+        combined = f"{install_cmd} {startup_cmd or ''}".lower()
+        if "package.json" not in files and not any(token in combined for token in ("npm", "pnpm", "yarn", "next")):
+            return
+
+        package_json = files.get("package.json", "")
+        probe_cmd = "test -d /home/user/node_modules"
+        if "\"next\"" in package_json or "'next'" in package_json or "next" in combined:
+            probe_cmd = "test -x /home/user/node_modules/.bin/next"
+
+        probe = await sandbox.commands.run(
+            f"bash -lc 'if {probe_cmd}; then echo READY; else echo MISSING; fi'",
+            cwd="/home/user",
+            timeout=10,
+        )
+        if "READY" in (probe.stdout or ""):
+            return
+
+        logger.info("Preview dependencies missing in sandbox %s — running %s", sandbox_id, install_cmd)
+        install_result = await self.install_deps(sandbox_id, install_cmd)
+        if install_result.exit_code != 0:
+            stderr = (install_result.stderr or install_result.stdout or "").strip()
+            raise RuntimeError(f"Dependency install failed: {stderr[:400]}")
 
     async def start_preview(self, sandbox_id: str, startup_cmd: str, health_path: str = "/health") -> str:
         """

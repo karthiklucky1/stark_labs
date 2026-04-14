@@ -84,8 +84,9 @@ class HardeningService:
                         .where(RequirementSpec.session_id == session_id)
                         .where(RequirementSpec.confirmed == True)
                         .order_by(RequirementSpec.version.desc())
+                        .limit(1)
                     )
-                    spec = result.scalar_one_or_none()
+                    spec = result.scalars().first()
                     if not spec:
                         raise ValueError("No confirmed spec found for hardening")
 
@@ -93,8 +94,10 @@ class HardeningService:
                         select(BuildCandidate)
                         .where(BuildCandidate.session_id == session_id)
                         .where(BuildCandidate.is_baseline == True)
+                        .order_by(BuildCandidate.updated_at.desc(), BuildCandidate.created_at.desc(), BuildCandidate.id.desc())
+                        .limit(1)
                     )
-                    baseline = result.scalar_one_or_none()
+                    baseline = result.scalars().first()
                     if not baseline:
                         raise ValueError("No baseline candidate found for hardening")
 
@@ -330,7 +333,9 @@ class HardeningService:
                                 "result_type": result_type,
                                 "failure_type": mark_run.failure_type,
                                 "rejection_reason": mark_run.rejection_reason,
+                                "swarm_report_json": map_swarm_report_to_db(report),
                                 "patch_summary": mark_run.patch_summary,
+                                "repair_provider": mark_run.repair_provider,
                             },
                         ))
 

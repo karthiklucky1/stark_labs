@@ -3,8 +3,14 @@ import "./globals.css";
 import Navbar from "@/components/Navbar";
 
 export const metadata: Metadata = {
-  title: "Mark II Studio — Build. Break. Heal.",
+  title: "Stark Studio — Build. Break. Heal.",
+  applicationName: "Stark Studio",
   description: "Team-facing AI build platform. Submit a prompt or code, watch AI models build in parallel, then harden for production.",
+  icons: {
+    icon: [{ url: "/stark-studio-icon.svg", type: "image/svg+xml" }],
+    shortcut: [{ url: "/stark-studio-icon.svg", type: "image/svg+xml" }],
+    apple: [{ url: "/stark-studio-icon.svg", type: "image/svg+xml" }],
+  },
 };
 
 export default function RootLayout({

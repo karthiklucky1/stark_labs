@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Stark Studio icon">
+  <defs>
+    <linearGradient id="starkGradient" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00d4ff"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="48" height="48" rx="12" fill="url(#starkGradient)"/>
+  <path
+    d="M34.5 13 22.5 29.5H33l-2.5 21.5L42.5 34.5H31.5L34.5 13Z"
+    fill="none"
+    stroke="#030712"
+    stroke-width="4"
+    stroke-linejoin="round"
+    stroke-linecap="round"
+  />
+</svg>

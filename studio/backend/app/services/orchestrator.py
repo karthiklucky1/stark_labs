@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -154,6 +155,131 @@ def _compact_profile_instructions(profile_instructions: str) -> str:
     if omitted > 0:
         text += f"\n... {omitted} additional instruction lines omitted"
     return _truncate_text(text, max_chars=1800)
+
+
+_REVIEW_KEYWORD_STOPWORDS = {
+    "the", "and", "with", "from", "that", "this", "into", "while", "under",
+    "during", "should", "would", "could", "must", "need", "review", "module",
+    "provider", "target", "critical", "issue", "issues", "summary", "followups",
+    "followup", "suggested", "concerns", "concern", "interface", "gaps",
+    "logic", "errors", "error", "contract", "mismatch", "reviewer",
+}
+
+
+def _extract_review_items(review_payload: dict[str, Any], key: str) -> list[str]:
+    value = review_payload.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _critical_review_issues(review_payload: dict[str, Any]) -> list[str]:
+    return _extract_review_items(review_payload, "critical_issues")
+
+
+def _review_keywords(review_entries: list[dict[str, Any]]) -> set[str]:
+    corpus: list[str] = []
+    for entry in review_entries:
+        review = entry.get("review") or {}
+        corpus.extend(_critical_review_issues(review))
+        corpus.extend(_extract_review_items(review, "interface_gaps"))
+        corpus.extend(_extract_review_items(review, "suggested_followups"))
+
+    tokens = {
+        token
+        for token in re.findall(r"[a-zA-Z_]{3,}", " ".join(corpus).lower())
+        if token not in _REVIEW_KEYWORD_STOPWORDS
+    }
+    return tokens
+
+
+def _score_review_rewrite_path(
+    path: str,
+    content: str,
+    *,
+    owned_files: set[str],
+    keywords: set[str],
+) -> int:
+    lower_path = path.lower()
+    lower_content = content.lower()
+    score = 0
+
+    if path in owned_files:
+        score += 200
+    if lower_path.endswith(("route.ts", "route.js", "page.tsx", "page.jsx", ".py", ".tsx", ".ts", ".js", ".jsx")):
+        score += 20
+    if any(keyword in lower_path for keyword in keywords):
+        score += 60
+    if any(keyword in lower_content[:4000] for keyword in keywords):
+        score += 10
+    return score
+
+
+def _select_review_rewrite_context(
+    source_files: dict[str, str],
+    module_scope: dict[str, Any],
+    review_entries: list[dict[str, Any]],
+) -> tuple[str, dict[str, str]]:
+    if not source_files:
+        return "main.py", {}
+
+    owned_files = set(module_scope.get("owned_files", []))
+    keywords = _review_keywords(review_entries)
+    ranked = sorted(
+        source_files.items(),
+        key=lambda item: _score_review_rewrite_path(
+            item[0],
+            item[1],
+            owned_files=owned_files,
+            keywords=keywords,
+        ),
+        reverse=True,
+    )
+
+    target_file = ranked[0][0]
+    context_files: dict[str, str] = {}
+    for name, content in ranked[1:]:
+        if len(context_files) >= 4:
+            break
+        if name in owned_files or any(keyword in name.lower() for keyword in keywords):
+            context_files[name] = content
+
+    if len(context_files) < 2:
+        for name, content in ranked[1:]:
+            if len(context_files) >= 4:
+                break
+            if name not in context_files:
+                context_files[name] = content
+
+    return target_file, context_files
+
+
+def _format_review_rewrite_details(
+    provider: str,
+    module_scope: dict[str, Any],
+    review_entries: list[dict[str, Any]],
+) -> str:
+    module_name = module_scope.get("module_name") or f"{provider.title()} module"
+    lines = [f"Peer-review rewrite gate for {provider} ({module_name})."]
+    for entry in review_entries:
+        reviewer = entry.get("reviewer") or "reviewer"
+        review = entry.get("review") or {}
+        critical = _critical_review_issues(review)
+        interface_gaps = _extract_review_items(review, "interface_gaps")
+        followups = _extract_review_items(review, "suggested_followups")
+        summary = str(review.get("summary") or "").strip()
+        if summary:
+            lines.append(f"{reviewer} summary: {summary}")
+        if critical:
+            lines.append("Critical issues:")
+            lines.extend(f"- {item}" for item in critical[:6])
+        if interface_gaps:
+            lines.append("Interface gaps:")
+            lines.extend(f"- {item}" for item in interface_gaps[:4])
+        if followups:
+            lines.append("Suggested follow-ups:")
+            lines.extend(f"- {item}" for item in followups[:4])
+    return "\n".join(lines)
 
 
 def _build_builder_requirements(
@@ -340,6 +466,7 @@ class Orchestrator:
         deterministic_plan = build_deterministic_plan(
             profile_type=profile.name,
             base_blueprint=base_blueprint,
+            requirements_json=spec.requirements_json or {},
             planned_builders=planned_builders,
         )
 
@@ -350,6 +477,7 @@ class Orchestrator:
             "council_proposals": [],
             "master_blueprint": deterministic_plan,
             "peer_reviews": [],
+            "rewrite_gate": [],
             "synthesis": {},
         }
         await self._persist_architecture_state(session_id, architecture_json)
@@ -404,6 +532,7 @@ class Orchestrator:
             "council_proposals": council_proposals,
             "master_blueprint": master_blueprint,
             "peer_reviews": [],
+            "rewrite_gate": [],
             "synthesis": {},
         }
         await self._persist_architecture_state(session_id, architecture_json)
@@ -464,6 +593,184 @@ class Orchestrator:
                 review_payload = review_result
             finalized.append({"reviewer": reviewer, "target": target, "review": review_payload})
         return finalized
+
+    async def _apply_peer_review_rewrites(
+        self,
+        *,
+        session_id: uuid.UUID,
+        spec: RequirementSpec,
+        profile,
+        master_blueprint: dict[str, Any],
+        candidate_payloads: list[dict[str, Any]],
+        peer_reviews: list[dict[str, Any]],
+        builder_catalog: dict[str, tuple[str, object]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        payload_by_provider = {payload["provider"]: payload for payload in candidate_payloads}
+        rewrite_gate: list[dict[str, Any]] = []
+
+        for provider in list(payload_by_provider.keys()):
+            review_entries = [entry for entry in peer_reviews if entry.get("target") == provider]
+            review_payloads = [entry.get("review") or {} for entry in review_entries]
+            critical_issues = [item for review in review_payloads for item in _critical_review_issues(review)]
+
+            if not review_entries:
+                continue
+
+            if not critical_issues:
+                gate_record = {
+                    "provider": provider,
+                    "status": "approved",
+                    "rewrite_applied": False,
+                    "summary": "Peer review found no critical issues.",
+                }
+                rewrite_gate.append(gate_record)
+                for entry in review_entries:
+                    entry["rewrite_gate"] = gate_record
+                continue
+
+            payload = payload_by_provider.get(provider)
+            builder_tuple = builder_catalog.get(provider)
+            module_scope = master_blueprint.get("provider_modules", {}).get(provider, {})
+            if not payload or not builder_tuple:
+                gate_record = {
+                    "provider": provider,
+                    "status": "skipped",
+                    "rewrite_applied": False,
+                    "summary": "Peer review flagged critical issues but no builder was available for rewrite.",
+                }
+                rewrite_gate.append(gate_record)
+                for entry in review_entries:
+                    entry["rewrite_gate"] = gate_record
+                continue
+
+            source_files = dict(payload.get("files_json") or {})
+            if not source_files:
+                gate_record = {
+                    "provider": provider,
+                    "status": "skipped",
+                    "rewrite_applied": False,
+                    "summary": "Peer review flagged critical issues but the contributor had no files to rewrite.",
+                }
+                rewrite_gate.append(gate_record)
+                for entry in review_entries:
+                    entry["rewrite_gate"] = gate_record
+                continue
+
+            builder = builder_tuple[1]
+            scoped_requirements = build_provider_requirements(
+                base_requirements=_build_builder_requirements(spec, profile, provider),
+                master_blueprint=master_blueprint,
+                provider=provider,
+            )
+            failure_details = _format_review_rewrite_details(provider, module_scope, review_entries)
+
+            await event_bus.publish(SessionStatusEvent(
+                session_id=session_id,
+                data={"status": "judging", "detail": f"Peer review flagged {provider} — scoped rewrite gate running…"},
+            ))
+            await event_bus.publish(BuildProgressEvent(
+                session_id=session_id,
+                data={"provider": provider, "status": "running", "detail": f"{provider}: Peer-review rewrite gate patching critical issues…"},
+            ))
+
+            started_at = time.perf_counter()
+            target_file = None
+            try:
+                if provider == "openai":
+                    target_file, context_files = _select_review_rewrite_context(
+                        source_files,
+                        module_scope,
+                        review_entries,
+                    )
+                    repair_result = await builder.repair(
+                        failure_type="PeerReviewCriticalConcerns",
+                        source_files=source_files,
+                        failure_details=failure_details,
+                        requirements_json=scoped_requirements,
+                        target_file=target_file,
+                        context_files=context_files,
+                    )
+                else:
+                    repair_result = await builder.repair(
+                        failure_type="PeerReviewCriticalConcerns",
+                        source_files=source_files,
+                        failure_details=failure_details,
+                        requirements_json=scoped_requirements,
+                    )
+            except Exception as exc:
+                error_detail = str(exc)
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+                gate_record = {
+                    "provider": provider,
+                    "status": "failed",
+                    "rewrite_applied": False,
+                    "summary": f"Rewrite gate failed: {error_detail}",
+                    "duration_ms": duration_ms,
+                    "target_file": target_file,
+                }
+                rewrite_gate.append(gate_record)
+                for entry in review_entries:
+                    entry["rewrite_gate"] = gate_record
+                    entry["rewrite_applied"] = False
+                    entry["rewrite_error"] = error_detail
+                await event_bus.publish(BuildProgressEvent(
+                    session_id=session_id,
+                    data={"provider": provider, "status": "failed", "detail": f"{provider}: Rewrite gate failed — continuing with reviewed module"},
+                ))
+                continue
+
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            repaired_delta = repair_result.get("files") if isinstance(repair_result, dict) else {}
+            repaired_delta = repaired_delta if isinstance(repaired_delta, dict) else {}
+            merged_files = dict(source_files)
+            merged_files.update({path: content for path, content in repaired_delta.items() if isinstance(content, str)})
+            rewrite_applied = merged_files != source_files
+            summary = str(
+                (repair_result or {}).get("summary")
+                or ("Scoped rewrite applied from peer-review concerns." if rewrite_applied else "Rewrite gate produced no file changes.")
+            ).strip()
+
+            gate_record = {
+                "provider": provider,
+                "status": "rewritten" if rewrite_applied else "no_changes",
+                "rewrite_applied": rewrite_applied,
+                "summary": summary,
+                "duration_ms": duration_ms,
+                "target_file": target_file,
+                "critical_issues": critical_issues[:6],
+            }
+            rewrite_gate.append(gate_record)
+            for entry in review_entries:
+                entry["rewrite_gate"] = gate_record
+                entry["rewrite_applied"] = rewrite_applied
+                entry["rewrite_summary"] = summary
+
+            if rewrite_applied:
+                existing_log = str(payload.get("build_log") or "").strip()
+                payload["files_json"] = merged_files
+                payload["build_log"] = (
+                    f"{existing_log}\nPeer-review rewrite: {summary}".strip()
+                    if existing_log
+                    else f"Peer-review rewrite: {summary}"
+                )
+                payload["patch_summary"] = summary
+                payload["candidate_format"] = "assembly_contributor_rewritten"
+                previous_duration = payload.get("build_duration_ms")
+                if isinstance(previous_duration, (int, float)):
+                    payload["build_duration_ms"] = round(float(previous_duration) + duration_ms, 2)
+                else:
+                    payload["build_duration_ms"] = duration_ms
+                await event_bus.publish(BuildProgressEvent(
+                    session_id=session_id,
+                    data={"provider": provider, "status": "running", "detail": f"{provider}: Peer-review rewrite applied before synthesis"},
+                ))
+            else:
+                await event_bus.publish(BuildProgressEvent(
+                    session_id=session_id,
+                    data={"provider": provider, "status": "running", "detail": f"{provider}: Rewrite gate found no file changes"},
+                ))
+
+        return list(payload_by_provider.values()), rewrite_gate
 
     async def _score_contributors(
         self,
@@ -643,8 +950,9 @@ class Orchestrator:
                     select(RequirementSpec)
                     .where(RequirementSpec.session_id == session_id)
                     .order_by(RequirementSpec.version.desc())
+                    .limit(1)
                 )
-                spec = result.scalar_one_or_none()
+                spec = result.scalars().first()
                 if spec is None:
                     raise ValueError("No requirement spec found for this session")
 
@@ -739,8 +1047,9 @@ class Orchestrator:
                     .where(RequirementSpec.session_id == session_id)
                     .where(RequirementSpec.confirmed == True)
                     .order_by(RequirementSpec.version.desc())
+                    .limit(1)
                 )
-                spec = result.scalar_one_or_none()
+                spec = result.scalars().first()
                 if spec is None:
                     raise ValueError("No confirmed spec found")
 
@@ -770,8 +1079,11 @@ class Orchestrator:
                     .where(RequirementSpec.session_id == session_id)
                     .where(RequirementSpec.confirmed == True)
                     .order_by(RequirementSpec.version.desc())
+                    .limit(1)
                 )
-                spec = result.scalar_one_or_none()
+                spec = result.scalars().first()
+                if spec is None:
+                    raise ValueError("No confirmed spec found")
                 profile = get_profile(session.profile_type or "unsupported", blueprint=spec.blueprint_json)
 
             full_requirements_size = len(str(spec.requirements_json or {}))
@@ -821,8 +1133,10 @@ class Orchestrator:
                         select(BuildCandidate)
                         .where(BuildCandidate.session_id == session_id)
                         .where(BuildCandidate.provider == provider)
+                        .order_by(BuildCandidate.updated_at.desc(), BuildCandidate.created_at.desc(), BuildCandidate.id.desc())
+                        .limit(1)
                     )
-                    existing = existing_result.scalar_one_or_none()
+                    existing = existing_result.scalars().first()
                     if existing and existing.status in ("built", "complete", "failed"):
                         logger.info("Skipping %s — candidate already exists (%s)", provider, existing.status)
                     else:
@@ -833,7 +1147,7 @@ class Orchestrator:
                 await self._judge_candidates(session_id)
                 return
 
-            tasks = []
+            tasks: list[asyncio.Task[dict[str, Any]]] = []
             for provider, model, builder in providers_to_build:
                 module_scope = master_blueprint.get("provider_modules", {}).get(provider, {})
                 module_name = module_scope.get("module_name") or f"{provider.title()} module"
@@ -864,83 +1178,87 @@ class Orchestrator:
                             session_id=session_id,
                             data={"provider": p, "status": "running", "detail": f"{p}: Building owned module surface…"},
                         ))
-                        res = await b.build_from_spec(
-                            requirements_json=assembly_requirements,
-                            profile_type=profile.name,
-                            profile_instructions=compact_profile_instructions,
+                        res = await asyncio.wait_for(
+                            b.build_from_spec(
+                                requirements_json=assembly_requirements,
+                                profile_type=profile.name,
+                                profile_instructions=compact_profile_instructions,
+                            ),
+                            timeout=settings.max_build_timeout_s,
                         )
                         await event_bus.publish(BuildProgressEvent(
                             session_id=session_id,
                             data={"provider": p, "status": "running", "detail": f"{p}: Packaging contribution…"},
                         ))
                         return {
+                            "provider": p,
+                            "model": m,
                             "result": res,
+                            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                            "module_scope": scope,
+                        }
+                    except asyncio.TimeoutError:
+                        return {
+                            "provider": p,
+                            "model": m,
+                            "error": f"Build timed out after {settings.max_build_timeout_s}s",
                             "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
                             "module_scope": scope,
                         }
                     except Exception as exc:
                         return {
+                            "provider": p,
+                            "model": m,
                             "error": str(exc),
                             "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
                             "module_scope": scope,
                         }
 
-                tasks.append(_task_wrapper())
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            logger.info("All modular assembly builds completed (count: %d)", len(results))
+                tasks.append(asyncio.create_task(_task_wrapper()))
 
             async with async_session_factory() as db:
-                for idx, (provider, model, _builder) in enumerate(providers_to_build):
-                    build_result = results[idx]
+                completed_count = 0
+                for task in asyncio.as_completed(tasks):
+                    build_result = await task
+                    provider = str(build_result.get("provider"))
+                    model = str(build_result.get("model"))
                     logger.info("Processing module contributor result for builder: %s", provider)
-                    module_scope = master_blueprint.get("provider_modules", {}).get(provider, {})
-
-                    if isinstance(build_result, Exception):
-                        logger.error("Build failed for %s: %s", provider, build_result)
+                    module_scope = build_result.get("module_scope") or master_blueprint.get("provider_modules", {}).get(provider, {})
+                    duration_ms = build_result.get("duration_ms")
+                    if build_result.get("error"):
+                        logger.error("Build failed for %s: %s", provider, build_result["error"])
                         candidate = BuildCandidate(
                             session_id=session_id,
                             provider=provider,
                             model=model,
                             status="failed",
-                            build_log=str(build_result),
+                            build_log=build_result["error"],
+                            build_duration_ms=duration_ms,
                             module_scope_json=module_scope,
                             candidate_format="assembly_contributor",
                         )
                     else:
-                        duration_ms = build_result.get("duration_ms")
-                        if build_result.get("error"):
-                            logger.error("Build failed for %s: %s", provider, build_result["error"])
-                            candidate = BuildCandidate(
-                                session_id=session_id,
-                                provider=provider,
-                                model=model,
-                                status="failed",
-                                build_log=build_result["error"],
-                                build_duration_ms=duration_ms,
-                                module_scope_json=module_scope,
-                                candidate_format="assembly_contributor",
-                            )
-                        else:
-                            build_payload = build_result.get("result") or {}
-                            files, files_changed = repair_nextjs_project_files(build_payload.get("files", {}))
-                            if files_changed:
-                                logger.info("Applied deterministic Next.js file repair for provider %s", provider)
+                        build_payload = build_result.get("result") or {}
+                        files, files_changed = repair_nextjs_project_files(build_payload.get("files", {}))
+                        if files_changed:
+                            logger.info("Applied deterministic Next.js file repair for provider %s", provider)
 
-                            candidate = BuildCandidate(
-                                session_id=session_id,
-                                provider=provider,
-                                model=model,
-                                status="built",
-                                files_json=files,
-                                build_log=build_payload.get("summary", ""),
-                                build_duration_ms=duration_ms,
-                                module_scope_json=module_scope,
-                                candidate_format="assembly_contributor",
-                            )
+                        candidate = BuildCandidate(
+                            session_id=session_id,
+                            provider=provider,
+                            model=model,
+                            status="built",
+                            files_json=files,
+                            build_log=build_payload.get("summary", ""),
+                            build_duration_ms=duration_ms,
+                            module_scope_json=module_scope,
+                            candidate_format="assembly_contributor",
+                        )
 
                     db.add(candidate)
                     await db.flush()
+                    await db.commit()
+                    completed_count += 1
 
                     await event_bus.publish(CandidateReadyEvent(
                         session_id=session_id,
@@ -953,6 +1271,10 @@ class Orchestrator:
                             "duration_ms": candidate.build_duration_ms,
                         },
                     ))
+                    await event_bus.publish(SessionStatusEvent(
+                        session_id=session_id,
+                        data={"status": "building", "detail": f"Assembly progress — {completed_count}/{len(tasks)} contributors finished"},
+                    ))
                     await asyncio.sleep(0.1)
 
                 session = await self._get_session(db, session_id)
@@ -962,14 +1284,25 @@ class Orchestrator:
                 await db.commit()
                 logger.info("Module contributors committed for session %s", session_id)
 
+            logger.info("All modular assembly builds completed (count: %d)", len(tasks))
+
             logger.info("Transitioning to synthesis for session %s", session_id)
             await self._judge_candidates(session_id)
 
         except Exception as e:
             logger.error("Build pipeline error: %s", e)
+            error_detail = str(e).strip() or e.__class__.__name__
+            async with async_session_factory() as db:
+                session = await self._get_session(db, session_id)
+                session.status = "failed"
+                await db.commit()
+            await event_bus.publish(SessionStatusEvent(
+                session_id=session_id,
+                data={"status": "failed", "detail": f"Build pipeline failed: {error_detail}"[:240]},
+            ))
             await event_bus.publish(ErrorEvent(
                 session_id=session_id,
-                data={"error": str(e), "detail": "Build pipeline failed"},
+                data={"error": error_detail, "detail": "Build pipeline failed"},
             ))
 
     async def _judge_candidates(self, session_id: uuid.UUID) -> None:
@@ -984,8 +1317,9 @@ class Orchestrator:
                 .where(RequirementSpec.session_id == session_id)
                 .where(RequirementSpec.confirmed == True)
                 .order_by(RequirementSpec.version.desc())
+                .limit(1)
             )
-            spec = result.scalar_one_or_none()
+            spec = result.scalars().first()
 
             result = await db.execute(
                 select(BuildCandidate)
@@ -1003,6 +1337,10 @@ class Orchestrator:
                 session = await self._get_session(db, session_id)
                 session.status = "failed"
                 await db.commit()
+            await event_bus.publish(SessionStatusEvent(
+                session_id=session_id,
+                data={"status": "failed", "detail": "All module contributors failed"},
+            ))
             await event_bus.publish(ErrorEvent(
                 session_id=session_id,
                 data={"error": "No successful candidates", "detail": "All module contributors failed"},
@@ -1047,14 +1385,18 @@ class Orchestrator:
                 "model": candidate.model,
                 "files_json": dict(candidate.files_json or {}),
                 "build_log": candidate.build_log,
+                "patch_summary": candidate.patch_summary,
+                "build_duration_ms": candidate.build_duration_ms,
                 "module_scope_json": dict(candidate.module_scope_json or {}),
                 "test_results_json": dict(candidate.test_results_json or {}),
+                "candidate_format": candidate.candidate_format,
             }
             for candidate in candidates
         ]
         master_blueprint = architecture_json.get("master_blueprint") or build_deterministic_plan(
             profile_type=profile.name,
             base_blueprint=spec.blueprint_json if spec else {},
+            requirements_json=spec.requirements_json if spec else {},
             planned_builders=[candidate["provider"] for candidate in candidate_payloads],
         )
 
@@ -1065,6 +1407,16 @@ class Orchestrator:
         peer_reviews = await self._run_peer_reviews(
             master_blueprint=master_blueprint,
             candidate_payloads=candidate_payloads,
+            builder_catalog=self._available_builders(),
+        )
+
+        candidate_payloads, rewrite_gate = await self._apply_peer_review_rewrites(
+            session_id=session_id,
+            spec=spec,
+            profile=profile,
+            master_blueprint=master_blueprint,
+            candidate_payloads=candidate_payloads,
+            peer_reviews=peer_reviews,
             builder_catalog=self._available_builders(),
         )
 
@@ -1100,8 +1452,10 @@ class Orchestrator:
             )
             persisted_candidates = list(result.scalars().all())
             candidate_by_provider = {candidate.provider: candidate for candidate in persisted_candidates}
+            payload_by_provider = {payload["provider"]: payload for payload in candidate_payloads}
 
             for candidate in persisted_candidates:
+                payload = payload_by_provider.get(candidate.provider, {})
                 raw_score = None
                 if isinstance(scores.get(candidate.provider), dict):
                     raw_score = scores[candidate.provider].get("total_weighted")
@@ -1109,6 +1463,12 @@ class Orchestrator:
                     candidate.score = float(raw_score) if raw_score is not None else candidate.score
                 except (TypeError, ValueError):
                     candidate.score = candidate.score
+                if payload:
+                    candidate.files_json = dict(payload.get("files_json") or candidate.files_json or {})
+                    candidate.build_log = str(payload.get("build_log") or candidate.build_log or "")
+                    candidate.patch_summary = payload.get("patch_summary")
+                    candidate.build_duration_ms = payload.get("build_duration_ms") or candidate.build_duration_ms
+                    candidate.candidate_format = str(payload.get("candidate_format") or candidate.candidate_format)
                 candidate.review_notes_json = [
                     review for review in peer_reviews
                     if review.get("target") == candidate.provider
@@ -1139,6 +1499,7 @@ class Orchestrator:
 
             architecture_json["stage"] = "synthesized"
             architecture_json["peer_reviews"] = peer_reviews
+            architecture_json["rewrite_gate"] = rewrite_gate
             architecture_json["synthesis"] = {
                 "summary": merged.get("summary", ""),
                 "contributions": merged.get("contributions", {}),
@@ -1207,8 +1568,10 @@ class Orchestrator:
                 select(BuildCandidate)
                 .where(BuildCandidate.session_id == session_id)
                 .where(BuildCandidate.is_baseline == True)
+                .order_by(BuildCandidate.updated_at.desc(), BuildCandidate.created_at.desc(), BuildCandidate.id.desc())
+                .limit(1)
             )
-            baseline = result.scalar_one_or_none()
+            baseline = result.scalars().first()
             if not baseline:
                 return
 
@@ -1222,8 +1585,9 @@ class Orchestrator:
                     .where(RequirementSpec.session_id == session_id)
                     .where(RequirementSpec.confirmed == True)
                     .order_by(RequirementSpec.version.desc())
+                    .limit(1)
                 )
-                spec = result.scalar_one_or_none()
+                spec = result.scalars().first()
                 
                 profile, runtime_profile, startup_cmd, install_cmd, health_path = _resolve_runtime_profile(
                     session,
