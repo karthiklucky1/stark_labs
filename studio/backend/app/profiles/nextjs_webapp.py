@@ -30,7 +30,7 @@ class NextJSWebAppProfile(BaseProfile):
 
     @property
     def install_command(self) -> str:
-        return "npm install"
+        return "export NODE_OPTIONS=--max-old-space-size=768 && npm install --no-fund --no-audit --legacy-peer-deps"
 
     @property
     def preview_mode(self) -> str:

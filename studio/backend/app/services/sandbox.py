@@ -91,15 +91,18 @@ class SandboxManager:
     def _escape_single_quotes(value: str) -> str:
         return value.replace("'", "'\"'\"'")
 
-    def _build_launch_command(self, startup_cmd: str) -> str:
-        escaped_startup_cmd = self._escape_single_quotes(startup_cmd)
-        # Use non-login shell (-c not -lc) to avoid login profile scripts (e.g. nohup wrappers
-        # in /etc/profile.d/) writing to service.log before the service starts.
-        # Explicitly prepend common bin paths so npm/uvicorn/python are found without login env.
-        return (
-            "bash -c 'export PATH=/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin:$PATH; "
-            f"exec {escaped_startup_cmd} > service.log 2>&1'"
+    async def _build_launch_command(self, sandbox: Any, startup_cmd: str) -> str:
+        if isinstance(sandbox, dict) and sandbox.get("mock"):
+            return "bash /home/user/launch.sh"
+            
+        script_content = (
+            "#!/bin/bash\n"
+            "export PATH=/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin:$PATH\n"
+            f"exec {startup_cmd} > /home/user/service.log 2>&1\n"
         )
+        await sandbox.files.write("/home/user/launch.sh", script_content)
+        await sandbox.commands.run("chmod +x /home/user/launch.sh")
+        return "/home/user/launch.sh"
 
     async def is_service_available(self, base_url: str, health_path: str = "/health") -> bool:
         try:
@@ -274,7 +277,7 @@ class SandboxManager:
             return preview_url
 
         service_port = self.infer_service_port(startup_cmd, health_path=health_path)
-        launch_cmd = self._build_launch_command(startup_cmd)
+        launch_cmd = await self._build_launch_command(sandbox, startup_cmd)
 
         # Kill any stale preview process already bound to the target port.
         # Preview self-heal can be triggered multiple times while the UI polls.
@@ -343,7 +346,7 @@ class SandboxManager:
         except Exception:
             pass
 
-        launch_cmd = self._build_launch_command(startup_cmd)
+        launch_cmd = await self._build_launch_command(sandbox, startup_cmd)
         logger.info("Starting service in sandbox %s: %s", sandbox_id, startup_cmd)
         await sandbox.commands.run(
             launch_cmd,

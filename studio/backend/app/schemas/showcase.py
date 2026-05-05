@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 class DemoStep(BaseModel):
     action: str
-    target: str
+    target: Optional[str] = None
     value: Optional[str] = None
     caption: str
     delay: int = 2000

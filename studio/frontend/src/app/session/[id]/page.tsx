@@ -1841,6 +1841,13 @@ export default function SessionPage() {
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  <a
+                    href={`${API}/sessions/${id}/artifacts/download`}
+                    className="text-xs px-3 py-1.5 rounded-lg font-semibold transition-all"
+                    style={{ background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.18)', color: '#86efac' }}
+                  >
+                    Download ZIP
+                  </a>
                   <button className="text-xs px-3 py-1.5 rounded-lg font-semibold transition-all"
                     style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)', color: 'var(--text-primary)' }}
                     onClick={exportSessionReport}>

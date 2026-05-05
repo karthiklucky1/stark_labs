@@ -100,7 +100,18 @@ class ShowcaseService:
             # Get the baseline candidate (the one being showcased)
             candidate = await self._get_latest_baseline_candidate(db, session_id)
             if not candidate:
-                logger.warning("No baseline candidate found for showcase generation in session %s", session_id)
+                # Fall back to any built candidate
+                result = await db.execute(
+                    select(BuildCandidate)
+                    .where(BuildCandidate.session_id == session_id)
+                    .where(BuildCandidate.status == "built")
+                    .order_by(BuildCandidate.updated_at.desc(), BuildCandidate.id.desc())
+                    .limit(1)
+                )
+                candidate = result.scalars().first()
+
+            if not candidate:
+                logger.warning("No candidate found for showcase generation in session %s", session_id)
                 return None
 
             # 1. Call Claude to generate the Chronicle

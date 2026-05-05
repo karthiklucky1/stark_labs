@@ -1558,7 +1558,7 @@ class Orchestrator:
 
     # ── Helpers ────────────────────────────────────────────
 
-    async def restart_sandbox(self, session_id: uuid.UUID) -> None:
+    async def restart_sandbox(self, session_id: uuid.UUID, force: bool = False) -> None:
         """Autonomously restore a missing or expired sandbox for a session."""
         async with async_session_factory() as db:
             session = await self._get_session(db, session_id)
@@ -1576,8 +1576,8 @@ class Orchestrator:
                 return
 
             # Check if still dead (prevent redundant restarts if many clients hit at once)
-            if not await sandbox_manager.is_sandbox_alive(baseline.sandbox_id):
-                logger.info("Self-healing: Restarting sandbox for session %s", session_id)
+            if force or not await sandbox_manager.is_sandbox_alive(baseline.sandbox_id):
+                logger.info("Self-healing: Restarting sandbox for session %s (force=%s)", session_id, force)
                 
                 # Fetch confirmed spec for blueprint
                 result = await db.execute(
