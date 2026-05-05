@@ -23,7 +23,7 @@ from app.models.requirement import RequirementSpec
 from app.providers.openai_builder import OpenAIBuilder
 from app.services.bridge import map_swarm_report_to_db
 from app.services.harvester import harvester_service
-from app.services.profiles import get_profile
+from app.services.profiles import detect_profile, get_profile
 from app.services.sandbox import sandbox_manager
 from app.schemas.events import (
     DeliveryReadyEvent,
@@ -110,20 +110,30 @@ class HardeningService:
                     current_sandbox_id: str = baseline.sandbox_id
                     current_files: dict = dict(baseline.files_json or {})
 
-                profile = get_profile(profile_type, blueprint=blueprint_json)
-                startup_cmd: str = profile.startup_command
-                health_path: str = profile.get_smoke_test_config().get("health_endpoint", "/health")
-
-                # If the dynamic profile has no startup command in the blueprint,
-                # try to infer one from the built files so the service can actually start.
-                if not startup_cmd:
-                    startup_cmd = _infer_startup_command(current_files)
-                    logger.warning("Blueprint has no startup_command — inferred: %s", startup_cmd)
-
                 # ── Mark loop ─────────────────────────────────────────────────
                 for mark_idx in range(settings.max_marks):
                     mark_number = mark_idx + 1
                     mark_name = settings.mark_names[mark_idx]
+
+                    resolved_profile_name, runtime_profile_name, startup_cmd, install_cmd, health_path = _resolve_runtime_service_plan(
+                        profile_type=profile_type,
+                        blueprint_json=blueprint_json,
+                        files=current_files,
+                    )
+
+                    # If the dynamic profile has no startup command in the blueprint,
+                    # try to infer one from the built files so the service can actually start.
+                    if not startup_cmd:
+                        startup_cmd = _infer_startup_command(current_files)
+                        logger.warning("Blueprint has no startup_command — inferred: %s", startup_cmd)
+
+                    if runtime_profile_name != resolved_profile_name:
+                        logger.info(
+                            "Hardening resolved runtime profile %s -> %s for session %s",
+                            resolved_profile_name,
+                            runtime_profile_name,
+                            session_id,
+                        )
 
                     await event_bus.publish(MarkStartedEvent(
                         session_id=session_id,
@@ -136,8 +146,8 @@ class HardeningService:
                         session_id=session_id,
                         sandbox_id=current_sandbox_id,
                         files=current_files,
-                        profile_type=profile_type,
-                        profile=profile,
+                        runtime_profile_name=runtime_profile_name,
+                        install_cmd=install_cmd,
                         startup_cmd=startup_cmd,
                         health_path=health_path,
                         mark_idx=mark_idx,
@@ -411,8 +421,8 @@ class HardeningService:
         session_id: uuid.UUID,
         sandbox_id: str,
         files: dict,
-        profile_type: str,
-        profile,
+        runtime_profile_name: str,
+        install_cmd: str,
         startup_cmd: str,
         health_path: str,
         mark_idx: int,
@@ -427,12 +437,12 @@ class HardeningService:
         self._last_sandbox_id = sandbox_id
 
         async def _start(sid: str, install: bool) -> str:
-            if install and not sid.startswith("mock-"):
+            if install and install_cmd and not sid.startswith("mock-"):
                 await event_bus.publish(SessionStatusEvent(
                     session_id=session_id,
                     data={"status": "hardening", "detail": "Installing dependencies in sandbox…"},
                 ))
-                await sandbox_manager.install_deps(sid, profile.install_command)
+                await sandbox_manager.install_deps(sid, install_cmd)
             return await sandbox_manager.run_service(sid, startup_cmd=startup_cmd, health_path=health_path)
 
         try:
@@ -454,7 +464,7 @@ class HardeningService:
                 data={"status": "hardening", "detail": "Cloud environment lost — re-provisioning sandbox…"},
             ))
             try:
-                new_sid = await sandbox_manager.create_sandbox(profile_type, str(session_id))
+                new_sid = await sandbox_manager.create_sandbox(runtime_profile_name, str(session_id))
                 await sandbox_manager.upload_files(new_sid, files)
 
                 # Persist new sandbox_id to DB
@@ -505,6 +515,53 @@ def _infer_startup_command(files: dict) -> str:
             module = name[:-3]
             return f"uvicorn {module}:app --host 0.0.0.0 --port 8000"
     return "python main.py"
+
+
+def _resolve_runtime_service_plan(
+    *,
+    profile_type: str,
+    blueprint_json: dict,
+    files: dict[str, str],
+) -> tuple[str, str, str, str, str]:
+    """
+    Resolve the runnable service plan for hardening.
+
+    Dynamic or unsupported sessions should adopt the detected runtime profile's
+    startup/install commands so hardening uses the same safer runtime contract
+    as preview restoration.
+    """
+    profile = get_profile(profile_type, blueprint=blueprint_json)
+    runtime_profile = profile
+    if files and (
+        profile.name in {"dynamic_profile", "unsupported"}
+        or not profile.startup_command
+        or not profile.install_command
+    ):
+        detected = detect_profile(files)
+        if detected.name != "unsupported":
+            runtime_profile = detected
+
+    startup_cmd = runtime_profile.startup_command or profile.startup_command
+    install_cmd = runtime_profile.install_command or profile.install_command
+
+    runtime_smoke = runtime_profile.get_smoke_test_config()
+    profile_smoke = profile.get_smoke_test_config()
+    if runtime_profile.preview_mode == "iframe" or profile.preview_mode == "iframe":
+        probe_path = (
+            runtime_smoke.get("page_endpoint")
+            or profile_smoke.get("page_endpoint")
+            or runtime_smoke.get("health_endpoint")
+            or profile_smoke.get("health_endpoint")
+            or "/"
+        )
+    else:
+        probe_path = (
+            runtime_smoke.get("health_endpoint")
+            or profile_smoke.get("health_endpoint")
+            or "/health"
+        )
+
+    return profile.name, runtime_profile.name, startup_cmd, install_cmd, probe_path
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
